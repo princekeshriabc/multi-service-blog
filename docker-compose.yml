@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  user-service:
+    build: ./user-service
+    ports:
+      - "3000:3000"
+    environment:
+      - DB_HOST=user-db
+    depends_on:
+      - user-db
+
+  blog-service:
+    build: ./blog-service
+    ports:
+      - "4000:4000"
+    environment:
+      - DB_HOST=blog-db
+    depends_on:
+      - blog-db
+
+  comment-service:
+    build: ./comment-service
+    ports:
+      - "5000:5000"
+    environment:
+      - DB_HOST=comment-db
+    depends_on:
+      - comment-db
+
+  user-db:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: userdb
+    volumes:
+      - user-db-data:/var/lib/postgresql/data
+
+  blog-db:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: blogdb
+    volumes:
+      - blog-db-data:/var/lib/postgresql/data
+
+  comment-db:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: commentdb
+    volumes:
+      - comment-db-data:/var/lib/postgresql/data
+
+volumes:
+  user-db-data:
+  blog-db-data:
+  comment-db-data:
