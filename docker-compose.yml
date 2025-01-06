@@ -1,59 +1,102 @@
 version: '3.8'
 
 services:
+  # User Service
   user-service:
-    build: ./user-service
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile
+    container_name: user-service
     ports:
       - "3000:3000"
     environment:
+      - NODE_ENV=production
       - DB_HOST=user-db
     depends_on:
       - user-db
+    networks:
+      - blog-network
+    restart: unless-stopped
 
+  # User Database
+  user-db:
+    image: postgres:14-alpine
+    container_name: user-db
+    environment:
+      POSTGRES_DB: userdb
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - user-db-data:/var/lib/postgresql/data
+    networks:
+      - blog-network
+    restart: unless-stopped
+
+  # Blog Service
   blog-service:
-    build: ./blog-service
+    build:
+      context: ./blog-service
+      dockerfile: Dockerfile
+    container_name: blog-service
     ports:
       - "4000:4000"
     environment:
+      - NODE_ENV=production
       - DB_HOST=blog-db
     depends_on:
       - blog-db
+    networks:
+      - blog-network
+    restart: unless-stopped
 
+  # Blog Database
+  blog-db:
+    image: postgres:14-alpine
+    container_name: blog-db
+    environment:
+      POSTGRES_DB: blogdb
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - blog-db-data:/var/lib/postgresql/data
+    networks:
+      - blog-network
+    restart: unless-stopped
+
+  # Comment Service
   comment-service:
-    build: ./comment-service
+    build:
+      context: ./comment-service
+      dockerfile: Dockerfile
+    container_name: comment-service
     ports:
       - "5000:5000"
     environment:
+      - NODE_ENV=production
       - DB_HOST=comment-db
     depends_on:
       - comment-db
+    networks:
+      - blog-network
+    restart: unless-stopped
 
-  user-db:
-    image: postgres:14
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: userdb
-    volumes:
-      - user-db-data:/var/lib/postgresql/data
-
-  blog-db:
-    image: postgres:14
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: blogdb
-    volumes:
-      - blog-db-data:/var/lib/postgresql/data
-
+  # Comment Database
   comment-db:
-    image: postgres:14
+    image: postgres:14-alpine
+    container_name: comment-db
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
       POSTGRES_DB: commentdb
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - comment-db-data:/var/lib/postgresql/data
+    networks:
+      - blog-network
+    restart: unless-stopped
+
+networks:
+  blog-network:
+    driver: bridge
 
 volumes:
   user-db-data:
