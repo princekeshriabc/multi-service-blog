@@ -1,6 +1,3 @@
-Here's the README.md file with proper markdown symbols and emojis:
-
-```markdown
 # 🚀 Multi-Service Blog Platform
 
 > 🌟 A modern, containerized blog platform built with microservices architecture, featuring user authentication, blog post management, and commenting capabilities.
@@ -170,12 +167,13 @@ multi-service-blog/
 
 ## 👥 Authors
 
-- Your Name - *Prince Keshri* - [🔗 YourGithub](https://github.com/princekeshriabc)
+- Name - *Prince Keshri* - [🔗 Github](https://github.com/princekeshriabc)
 
 
 ## 📞 Contact
 
  📧 cs21b1023@iiitr.ac.in
+ 
  📧 princekeshri252@gmail.com
 
 Project Link: [🔗 https://github.com/princekeshriabc/multi-service-blog](https://github.com/princekeshriabc/multi-service-blog)
