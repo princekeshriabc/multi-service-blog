@@ -1,0 +1,384 @@
+I’ll break each into:
+
+🔎 Detection Rules (Rule-Based) → What simple checks can classify this pattern.
+
+🤖 Detection Rules (ML-Based) → What signals/models help when rules are not enough.
+
+📖 Description Rules → What defines the pattern structurally.
+
+⚠️ Edge Cases → Situations where this pattern can be confused with others.
+
+📑 Rules for 5 IB Patterns
+Pattern A – Fully Structured Tables (Headers on All Pages) ✅
+
+🔎 Rule-Based Detection:
+
+Every page contains a header row.
+
+At least 2–3 header keywords (e.g., Description, Amount, Qty, Rate, Date) are present consistently across pages.
+
+Column positions (x-coordinates) and widths are nearly identical across pages.
+
+Row alignment is stable → every line of text fits neatly into columns.
+
+No page is “headerless”.
+
+🤖 ML-Based Detection:
+
+Layout embeddings (spatial features) across pages → cosine similarity > 0.9.
+
+Header embeddings → high semantic match (>0.95) between pages.
+
+CNN/Transformer classifier predicts “table grid” with high confidence.
+
+📖 Description:
+
+The cleanest format.
+
+Each page looks like an Excel sheet → same headers, same column count, same order.
+
+Rarely requires much cleaning.
+
+⚠️ Edge Cases:
+
+Some pages may contain totals/footnotes at the bottom — don’t misclassify them as corrupted.
+
+Repeated hospital logo/watermark in header area shouldn’t be mistaken for “extra headers.”
+
+Pattern B – Continuation Tables (Header Only on First Page) ➡️
+
+🔎 Rule-Based Detection:
+
+Page 1 contains a complete header row.
+
+Pages 2+ contain only rows (no headers).
+
+Row alignment (multiple columns) is consistent with Page 1.
+
+Continuation markers like “continued”, “page 2 of 4”, or “carried forward” may appear.
+
+Column count across rows is stable, matching Page 1 schema.
+
+🤖 ML-Based Detection:
+
+Header embeddings: Strong header match only on Page 1, not others.
+
+Row embeddings: Continuation pages align semantically with Page 1 rows.
+
+Sequence classifier detects document-level dependency (Page 2 continues Page 1).
+
+📖 Description:
+
+First page defines schema, subsequent pages inherit it.
+
+Used when hospital wants to save space by not repeating headers.
+
+Requires “carry-forward header” logic during processing.
+
+⚠️ Edge Cases:
+
+Sometimes later pages have partial headers (e.g., only “Description | Amount”).
+
+Page numbers or footer texts should not be mistaken as headers.
+
+Pattern C – Inconsistent Headers Across Pages ⚠️
+
+🔎 Rule-Based Detection:
+
+Headers exist on most/all pages.
+
+String similarity between header sets < 70%.
+
+Example: Page 1 → Description, Qty, Amount.
+Page 2 → Service, Charges, Date.
+
+Column counts or order differ between pages.
+
+Column bounding boxes not aligned across pages.
+
+🤖 ML-Based Detection:
+
+Header embeddings show semantic mismatch (similarity < 0.7).
+
+Layout embeddings show column drift (columns not in same positions).
+
+Model detects “schema drift” (trained on header variations).
+
+📖 Description:
+
+Headers keep changing (names, order, columns).
+
+Common in multi-department hospital bills where each dept. uses its own schema.
+
+Still structured, but not uniform.
+
+⚠️ Edge Cases:
+
+Need to differentiate between true inconsistency vs spelling variants (“Qty” vs “Quantity”).
+
+Sometimes only 1–2 pages differ → then IB may be Hybrid (Type E).
+
+Pattern D – Noisy / Corrupted Tables ❌
+
+🔎 Rule-Based Detection:
+
+Headers missing or merged → e.g., “Rev Code Date” instead of two separate columns.
+
+OCR errors → broken words, misaligned rows, merged cells.
+
+Inconsistent column count per row.
+
+<2 header keywords detected across most pages.
+
+OCR confidence score very low (<70%).
+
+🤖 ML-Based Detection:
+
+CNN/Table detection models → low probability of “grid-like table”.
+
+Row embeddings → scattered, not forming consistent alignment.
+
+Classifier predicts “OCR distortion” with high probability.
+
+📖 Description:
+
+Scanned/low-quality PDFs cause corrupted extraction.
+
+Structure is unreliable → headers broken or unreadable.
+
+Requires extra cleaning/normalization.
+
+⚠️ Edge Cases:
+
+Some bills may be partially corrupted (e.g., Page 2 noisy, rest structured). → could move to Type E.
+
+Need to confirm if corruption is local (few pages) or global (all pages).
+
+Pattern E – Hybrid Tables (Mixed Types) 🔄
+
+🔎 Rule-Based Detection:
+
+Different pages classified into different types (A–D).
+
+Example: Page 1 = Type A, Page 2 = Type B, Page 3 = Type D.
+
+Non-uniform classification across the document.
+
+Presence of multiple mini-tables with different schemas.
+
+Both digital and scanned pages may appear in same file.
+
+🤖 ML-Based Detection:
+
+Sequence model (document-level) detects transitions between patterns.
+
+Hybrid probability score >0.6 (strong mix of signals).
+
+Model learns that document is not homogeneous.
+
+📖 Description:
+
+Mixture of 2+ patterns within one IB.
+
+Common in insurance claims where hospital, pharmacy, and lab bills are merged.
+
+Requires page-wise classification first → then aggregate.
+
+⚠️ Edge Cases:
+
+If 90% of pages are one pattern and 1–2 pages differ → teams must decide whether to call it Hybrid (E) or majority type.
+
+Often best to default to Hybrid for safety.
+
+📊 Summary Table of Rules
+Pattern	Rule-Based Detection	ML Detection	Key Challenge
+A – Fully Structured	Headers on all pages; consistent schema; aligned columns	Layout/Header similarity >0.9	Very clean, easiest
+B – Continuation	Header only on first page; rows continue; “continued” markers	Row embeddings match; header missing later	Must carry header forward
+C – Inconsistent Headers	Headers differ across pages (<70% similarity)	Header embedding mismatch <0.7	Schema drift
+D – Noisy/Corrupted	Headers broken/missing; OCR errors; low confidence	Table-confidence <0.5; scattered rows	Needs reconstruction
+E – Hybrid	Mix of A–D across pages	Sequence model detects transitions	Page-level inconsistency
+
+📑 Rulebook for Itemized Bill (IB) Patterns
+
+We categorize all inpatient continuation tables into five universal patterns (A–E).
+Each pattern is defined by how headers behave across pages and how table structures align.
+This rulebook ensures consistent classification, easier automation, and standardization.
+
+Pattern A – Consistent Headers Across All Pages
+
+Characteristics
+
+Every page contains a header row.
+
+The header names remain identical across pages (same spelling, same order).
+
+Column count and alignment stay consistent.
+
+Example: Page 1 → Date | Rev Code | Description | Amount, Page 2 → exactly the same.
+
+Rules
+
+✅ If all pages have headers.
+
+✅ If headers are identical across all pages.
+
+✅ If column count matches page-to-page.
+
+➡️ Classify as Type A.
+
+Pattern B – Header Only on First Page
+
+Characteristics
+
+Only page 1 has a header row.
+
+Remaining pages contain rows only (no headers).
+
+Column order is preserved internally, but without headers.
+
+Example: Page 1 → header present, Page 2 → only data continues.
+
+Rules
+
+✅ If only the first page has a header.
+
+✅ If all subsequent pages have no headers at all.
+
+✅ If column count is consistent across pages.
+
+➡️ Classify as Type B.
+
+Pattern C – Inconsistent Headers Across Pages
+
+Characteristics
+
+Each page may contain headers, but they are not identical.
+
+Variations include:
+
+Extra/missing columns on some pages.
+
+Typos or spelling differences (Rev Code vs Revenue Code).
+
+Changed order (Date | Amount | Rev Code instead of Date | Rev Code | Amount).
+
+Example: Page 1 → Date | Rev Code | Amount, Page 2 → Date | Description | Amount.
+
+Rules
+
+✅ If headers exist on most/all pages.
+
+❌ But at least one page has header mismatch (name, spelling, order, or count).
+
+➡️ Classify as Type C.
+
+Pattern D – Headers Missing + Column Misalignment / Merged Cells
+
+Characteristics
+
+Some pages may lack headers.
+
+Columns may be merged or misaligned due to unstructured PDF formatting.
+
+Examples:
+
+Merged column: Rev Code Date (should be two columns).
+
+Missing column: Description absent in later pages.
+
+Shifted cells breaking alignment.
+
+Rules
+
+✅ If at least one page has merged headers or missing headers.
+
+✅ If column count differs drastically between pages.
+
+✅ If alignment errors present (merged cells, wrong splitting).
+
+➡️ Classify as Type D.
+
+Pattern E – Hybrid (Mix of Behaviors)
+
+Characteristics
+
+Combination of patterns A–D in one IB.
+
+Example cases:
+
+Some pages with headers, some without.
+
+Some pages consistent, some inconsistent.
+
+Random mix of merged cells, missing headers, and reordered headers.
+
+Often the most complex real-world IBs.
+
+Rules
+
+✅ If IB cannot be uniquely assigned to A–D.
+
+✅ If different rules apply to different sets of pages.
+
+➡️ Classify as Type E (Hybrid).
+
+
+📊 Detection Flow for IB Pattern Classification
+
+This flow acts like a decision tree. At each step, answer Yes / No and move forward until you land in one of the 5 types.
+
+Step 1 – Do all pages have headers?
+
+Yes → Go to Step 2
+
+No → Go to Step 4
+
+Step 2 – Are headers identical across all pages (names, order, count)?
+
+Yes → Pattern A (Consistent Headers)
+
+No → Pattern C (Inconsistent Headers)
+
+Step 3 – (Pattern A or C identified, stop here)
+Step 4 – Does only the first page have a header?
+
+Yes → Pattern B (Header only on first page)
+
+No → Go to Step 5
+
+Step 5 – Are there merged/misaligned/missing headers in some pages?
+
+Yes → Pattern D (Misaligned / Merged)
+
+No → Go to Step 6
+
+Step 6 – Do different pages show a mix of behaviors (some like A, some like B, some like D)?
+
+Yes → Pattern E (Hybrid)
+
+No → Double-check — fallback to manual review (rare edge cases).
+
+🔹 Example Walkthroughs
+
+Example 1
+
+Bill with headers on every page, exactly the same → Pattern A.
+
+Example 2
+
+First page has headers, next 4 pages only rows → Pattern B.
+
+Example 3
+
+Every page has headers, but order is shuffled on Page 3 → Pattern C.
+
+Example 4
+
+Page 2 has a merged column “Rev Code Date” → Pattern D.
+
+Example 5
+
+Pages 1–2 consistent headers, Page 3 missing header, Page 4 merged column → Pattern E.
+
+
+
