@@ -1,1 +1,207 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence, Any
+import logging
+import pandas as pd
+
+
+# ------------------------- Logging (production-ready) -------------------------
+# Configure a module-level logger and leave handlers/levels to the host app.
+logger = logging.getLogger(__name__)
+
+
+# ------------------------- Dataclasses: Config and Results --------------------
+@dataclass(frozen=True)
+class CodeValidators:
+    """
+    Inject domain validators if available; each callable takes a pd.Series of the
+    code values and returns a boolean mask (True = valid).
+    Provide None to skip a particular validator.
+    """
+    hcpcs: Optional[Callable[[pd.Series], pd.Series]] = None
+    cpt: Optional[Callable[[pd.Series], pd.Series]] = None
+    ndc: Optional[Callable[[pd.Series], pd.Series]] = None
+
+
+@dataclass(frozen=True)
+class ValidationConfig:
+    """
+    Centralized configuration to keep the validator generic and testable.
+    """
+    index_col: str = "index"
+    date_col: str = "ib_date"
+    date_format: str = "%Y-%m-%d"
+    record_locator_col: str = "adjudication_record_locator"
+    code_type_col: str = "cleaned_code_type"          # values like HCPCS/CPT/NDC
+    code_value_col: str = "procedure_code"            # the column to validate
+    rev_code_indicator_col: str = "rev_code_indicator"
+    service_code_col: str = "service_code"
+    record_locator_length: int = 10
+    enforce_rev_code_indicator: bool = True
+    required_columns: Sequence[str] = field(default_factory=lambda: (
+        "index",
+        "adjudication_record_locator",
+        "ib_date",
+        "cleaned_code_type",
+        "procedure_code",
+        "rev_code_indicator",
+        "service_code",
+        # Add more known columns here as the domain requires:
+        # "description", "quantity", "billed_amount", "page_number", ...
+    ))
+
+
+@dataclass
+class CheckResult:
+    name: str
+    ok: bool
+    details: Optional[str] = None
+
+
+@dataclass
+class ValidationReport:
+    ok: bool
+    checks: List[CheckResult] = field(default_factory=list)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "checks": [{"name": c.name, "ok": c.ok, "details": c.details} for c in self.checks],
+        }
+
+
+# ------------------------- Main Validator -------------------------
+@dataclass
+class IBValidator:
+    """
+    Industrial-grade, dependency-injected validator for an Itemized Bill dataframe.
+
+    - Uses dataclasses for clarity and maintainability.
+    - Accepts optional code validators to keep domain logic decoupled.
+    - Produces a structured ValidationReport for downstream systems.
+    """
+    unique_record_locator: str
+    admission_date: str
+    discharge_date: str
+    config: ValidationConfig = field(default_factory=ValidationConfig)
+    code_validators: CodeValidators = field(default_factory=CodeValidators)
+
+    # ----------------- Public API -----------------
+    def validate(self, ib_df: pd.DataFrame) -> ValidationReport:
+        """
+        Run all checks and return a structured report.
+        Any failed check logs details and contributes to the final status.
+        """
+        logger.info("Starting IB validation run")
+
+        checks: List[CheckResult] = []
+        checks.append(self._check_required_columns(ib_df))
+        checks.append(self._check_sorted_index(ib_df))
+        checks.append(self._check_record_locator(ib_df))
+        checks.append(self._check_dates(ib_df))
+        checks.append(self._check_code_types(ib_df))
+        checks.append(self._check_rev_code_indicator(ib_df))
+
+        overall_ok = all(c.ok for c in checks)
+        logger.info("IB validation complete | overall_ok=%s", overall_ok)
+
+        return ValidationReport(ok=overall_ok, checks=checks)
+
+    # ----------------- Individual Checks -----------------
+    def _check_required_columns(self, df: pd.DataFrame) -> CheckResult:
+        missing = [c for c in self.config.required_columns if c not in df.columns]
+        ok = len(missing) == 0
+        details = None if ok else f"Missing columns: {missing}"
+        if not ok:
+            logger.error(details)
+        return CheckResult("required_columns_present", ok, details)
+
+    def _check_sorted_index(self, df: pd.DataFrame) -> CheckResult:
+        col = self.config.index_col
+        if col not in df.columns:
+            return CheckResult("sorted_index", False, f"Missing index column '{col}'")
+        # Use pandas monotonic property for vectorized check
+        ok = pd.Series(df[col]).is_monotonic_increasing
+        details = None if ok else "Index column is not sorted ascending"
+        if not ok:
+            logger.warning(details)
+        return CheckResult("sorted_index", ok, details)
+
+    def _check_record_locator(self, df: pd.DataFrame) -> CheckResult:
+        col = self.config.record_locator_col
+        if col not in df.columns:
+            return CheckResult("unique_record_locator", False, f"Missing column '{col}'")
+        length_ok = len(self.unique_record_locator) == self.config.record_locator_length
+        same_all_rows = df[col].eq(self.unique_record_locator).all()
+        ok = length_ok and same_all_rows
+        details = None if ok else (
+            f"length_ok={length_ok}, same_all_rows={same_all_rows}"
+        )
+        if not ok:
+            logger.warning("Record locator failed | %s", details)
+        return CheckResult("unique_record_locator", ok, details)
+
+    def _check_dates(self, df: pd.DataFrame) -> CheckResult:
+        col = self.config.date_col
+        if col not in df.columns:
+            return CheckResult("dates_valid", False, f"Missing date column '{col}'")
+
+        # Robust parsing: coerce invalid strings to NaT, then check range
+        parsed = pd.to_datetime(df[col], format=self.config.date_format, errors="coerce")
+        format_ok = parsed.notna().all()
+        if not format_ok:
+            details = f"{col} contains unparsable dates"
+            logger.error(details)
+            return CheckResult("dates_valid", False, details)
+
+        start = pd.to_datetime(self.admission_date, format=self.config.date_format, errors="coerce")
+        end = pd.to_datetime(self.discharge_date, format=self.config.date_format, errors="coerce")
+
+        if pd.isna(start) or pd.isna(end):
+            details = "Admission/discharge dates are invalid per configured format"
+            logger.error(details)
+            return CheckResult("dates_valid", False, details)
+
+        in_range = (parsed >= start) & (parsed <= end)
+        ok = in_range.all()
+        details = None if ok else "Some ib_date values fall outside [admission_date, discharge_date]"
+        if not ok:
+            logger.warning(details)
+        return CheckResult("dates_valid", ok, details)
+
+    def _check_code_types(self, df: pd.DataFrame) -> CheckResult:
+        tcol, vcol = self.config.code_type_col, self.config.code_value_col
+        if tcol not in df.columns or vcol not in df.columns:
+            return CheckResult("code_types_valid", False, f"Missing '{tcol}' or '{vcol}'")
+
+        # Prepare per-type validators from dependency injection
+
+
+
+
+How to adapt to the current code
+Replace the old class with IBValidator and wire in any existing helper functions as injected validators so domain rules remain centralized and testable.
+
+Keep the date format in ValidationConfig aligned with upstream systems and pass errors='coerce' to avoid hard failures on malformed feed data while still flagging issues in the report.
+
+Configure the logger at the application entry point with handlers, formats, and levels per environment, and let this module only get the logger to remain library-friendly
+
+Why this scales
+Dataclasses make intent explicit and reduce hand-written init/equality/representation code, which shortens review cycles and improves reliability across teams.
+
+Vectorized checks avoid Python loops and scale to millions of rows while keeping the code concise and declarative for easy maintenance.
+
+The structured ValidationReport enables consistent machine consumption by pipelines, observability tools, and dashboards without ad-hoc parsing of printouts or logs.
+
+Notes for domain integration
+If legacy helpers exist (for example: is_valid_hcpcs_code, is_valid_cpt_code, is_valid_ndc), inject them via CodeValidators so the validator calls production-grade logic without duplication or tight coupling.
+
+If revenue code indicator is sometimes set manually, flip enforce_rev_code_indicator to False in config for that feed to reflect process realities while keeping auditability via the check detail
+
+What the in-code comments explain
+Each check is isolated, named, and returns a CheckResult, so failures are explicit and actionable rather than generic True/False results buried deep in control flow.
+
+Comments document the contract for injected validators and the guarantees each function makes, which is critical when multiple teams collaborate on healthcare billing datasets
+
 
