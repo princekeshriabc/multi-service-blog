@@ -1472,3 +1472,102 @@ doc_result = classify_document_pattern_a(tables, cfg)
 print(doc_result.is_type_a_document, round(doc_result.confidence, 3))
 for pr in doc_result.page_results:
     print(f"Page {pr.page_index} -> Type A: {pr.is_type_a}, conf={round(pr.confidence,3)}")
+
+
+
+# Short answer
+
+# You pass a list of TableInput objects.
+# Each TableInput contains:
+# df: the table CSV loaded into a pandas DataFrame (header=None, raw rows).
+# page_index: the document page number this table came from.
+# table_index_on_page: 1 if only one table per page (or increment if multiple).
+# header_info: your detected header rows/validity (HeaderInfo).
+# merged_cells: list of merged cell dicts with row_index/column_index/row_span/column_span (1-based, as in Textract).
+# Details
+
+# df (pandas.DataFrame): Read the CSV exactly as saved from Textract’s matrix (no header inference).
+# Use: pd.read_csv(path, header=None, dtype=str, keep_default_na=False)
+# The DataFrame’s row 0 should correspond to Textract table row_index 1, row 1 -> 2, etc.
+# header_info (HeaderInfo):
+# header_row_indices: 0-based indices of header rows in df (from your header detector).
+# header_valid: True/False from your validation.
+# header_names (optional): if you already built column names from header rows; otherwise leave None and the code will use the last header row values as the header names during analysis.
+# merged_cells: list of dicts for cells that span multiple rows/columns.
+# Required keys per item:
+# row_index: 1-based table row anchor (Textract RowIndex).
+# column_index: 1-based table column anchor (Textract ColumnIndex).
+# row_span: integer span (>=1).
+# column_span: integer span (>=1).
+# Example: {"row_index": 1, "column_index": 1, "row_span": 1, "column_span": 3}
+# If you don’t have merged cells, pass an empty list or None.
+# Optional input
+
+# PatternAConfig to tune thresholds:
+# max_row_colcount_deviation_ratio (default 0.2)
+# min_data_rows_for_analysis (default 5)
+# max_body_merged_anchors (default 0)
+# require_header_on_every_page, require_exact_header_equality_across_pages, require_equal_data_mode_cols_across_pages
+# Minimal example (building inputs and running document-level Pattern A)
+
+# Assume you already:
+# saved per-table CSVs,
+# detected header rows for each table (header_row_indices),
+# extracted merged cells from Textract JSON.
+
+# Example code:
+
+from typing import List
+import pandas as pd
+
+Your lists collected from earlier steps
+csv_paths = ["tables_out/page_1_t1.csv", "tables_out/page_2_t1.csv"]
+pages = [1, 2] # page_index for each table
+header_rows_per_table = [[0], []] # example: page 1 has header at row 0, page 2 has none
+merged_cells_per_table = [
+[ # page 1: a merged header cell spanning 3 columns
+{"row_index": 1, "column_index": 1, "row_span": 1, "column_span": 3}
+],
+[] # page 2: no merged cells detected
+]
+
+tables: List[TableInput] = []
+for i, path in enumerate(csv_paths):
+df = pd.read_csv(path, header=None, dtype=str, keep_default_na=False)
+hi = HeaderInfo(
+header_row_indices=header_rows_per_table[i],
+header_valid=bool(header_rows_per_table[i]), # or your own validation boolean
+header_names=None # let the detector use the last header row values
+)
+t = TableInput(
+df=df,
+page_index=pages[i],
+table_index_on_page=1,
+header_info=hi,
+merged_cells=merged_cells_per_table[i],
+)
+tables.append(t)
+
+Run Pattern A page-level + document-level detection
+doc_res = classify_document_pattern_a(tables) # PatternAConfig() is optional
+
+print("Document is Type A:", doc_res.is_type_a_document, "confidence:", round(doc_res.confidence, 3))
+for pr in doc_res.page_results:
+print(f"Page {pr.page_index} table {pr.table_index_on_page} -> Type A: {pr.is_type_a}, conf={round(pr.confidence,3)}")
+# Optional: pr.reasons for explanation
+
+# How to prepare merged_cells from Textract tables
+
+# If you kept the rich tables from the Textract JSON parsing step:
+# For each table, build merged_cells as:
+# for each cell in table["cells"]:
+# if RowSpan > 1 or ColumnSpan > 1: add a dict with row_index, column_index, row_span, column_span
+# Ensure row_index/column_index are the Textract 1-based indices aligned to the CSV’s row/column positions.
+# Notes
+
+# Do not skip header rows when reading the CSV into df. The classifier expects df to contain header rows at the top so it can compute data_start_row correctly based on header_row_indices.
+# If a table has very few data rows (< min_data_rows_for_analysis), lower the threshold in PatternAConfig.
+# This Pattern A detector is strict by default:
+# No merged cells allowed in the body (merged headers okay).
+# Consistent grid (stable column count) in the data rows.
+
