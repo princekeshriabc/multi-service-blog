@@ -986,3 +986,489 @@ det = detect_header_rows_in_top4(file)
 df = pd.read_csv(file, skiprows=det.rows_to_skip, header=None, dtype=str, keep_default_na=False)
 add df to list
 pd.concat(list_of_df, ignore_index=True)
+
+
+# Below is a clean, production-style implementation to classify each table into patterns A/B/C/D and the whole document into A/B/C/D/E. It uses dataclasses, clear feature extraction, and explainable rules aligned to your specification.
+
+# Inputs
+
+# tables: list of pandas DataFrames (each is one table extracted from a page).
+# merged_cells_per_table: list parallel to tables. For each table, a list of merged-cell dicts with at least:
+# row_index (1-based), column_index (1-based), row_span, column_span
+# Optional: covers (list of (row, col) 1-based positions)
+# Optional input (recommended)
+
+# header_info_list: list parallel to tables. If you already detect headers, pass:
+# header_row_indices: list of 0-based row indices in the top of the CSV that are headers (e.g., [0] or [0,1])
+# header_valid: bool
+# header_names: list of column names (if built from header rows; otherwise we’ll build them)
+# What the code returns
+
+# PagePatternResult for each table (A/B/C/D with confidence and reasons).
+# DocumentPatternResult for the whole PDF (A/B/C/D/E) with reasons and diagnostics.
+# Explanation of the approach
+
+# We compute features per table:
+# header presence and quality, normalized header names (synonym-aware)
+# data region start row, mode column count, row-column count variance
+# grid regularity, merged ratios in header and body
+# continuation markers (if visible in the table text)
+# We select a reference header (usually the first valid header page).
+# Per-page classification:
+# A: header present, grid-regular, consistent with reference
+# B: no header on continuation pages but grid-regular and consistent column structure with reference
+# C: header present, grid-regular, but inconsistent headers/schema vs. reference
+# D: noisy/corrupted (missing header and poor grid; high row variance; etc.)
+# Document-level classification:
+# A if all A
+# B if only A/B and B occurs on pages after the reference page
+# C if only A/C
+# D if all D
+# E if mixed kinds beyond the above
+# Code (drop-in)
+
+# Requires: pandas
+
+# Below is focused, production-style code to detect Pattern A (Fully Structured Tables) only.
+
+# What it does
+
+# Page-level: determines if a single table is Type A using:
+# header present on the page
+# grid-like structure (stable column count across data rows)
+# minimal/no merges in the body (merged cells are okay in header)
+# Document-level: determines if the entire document is Type A:
+# every table is Type A at page level
+# headers exist on every page and are exactly consistent (same names, same order)
+# data column counts are consistent across pages
+# No header normalization is performed (no synonyms). Only trimming/whitespace handling is used.
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Any, Tuple
+from enum import Enum
+import pandas as pd
+
+
+# =========================
+# Data models
+# =========================
+
+class TablePattern(str, Enum):
+    A = "A"  # Fully structured
+
+
+@dataclass
+class HeaderInfo:
+    # Your detector’s outputs for each table
+    header_row_indices: List[int]                  # 0-based indices of header rows
+    header_valid: bool = True                      # your detector’s validity flag
+    header_names: Optional[List[str]] = None       # column names built from header rows (as-is, not normalized)
+    debug: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TableInput:
+    df: pd.DataFrame
+    page_index: int                                # 1-based logical page
+    table_index_on_page: int = 1
+    header_info: Optional[HeaderInfo] = None
+    # merged_cells: list of dicts with keys row_index, column_index, row_span, column_span (1-based indices)
+    merged_cells: Optional[List[Dict[str, Any]]] = None
+
+
+@dataclass
+class TableAFeatures:
+    # Minimal features sufficient for Pattern A detection
+    has_header: bool
+    header_rows: List[int]                         # 0-based
+    header_names_raw: List[str]                    # as-is (not normalized)
+    header_cols_count: int
+    data_start_row: int                            # 0-based
+    data_rows_count: int
+    data_mode_cols: int                            # modal non-empty cell count across data rows
+    row_colcount_variance_ratio: float             # fraction of data rows deviating from mode
+    body_merged_anchors: int                       # merged cells starting in body rows
+    reasons: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PageAPatternResult:
+    page_index: int
+    table_index_on_page: int
+    is_type_a: bool
+    confidence: float
+    reasons: List[str]
+    features: TableAFeatures
+
+
+@dataclass
+class DocumentAResult:
+    is_type_a_document: bool
+    confidence: float
+    page_results: List[PageAPatternResult]
+    reference_page_index: Optional[int]
+    reference_headers: Optional[List[str]]
+    reasons: List[str]
+    header_equality_by_page: List[Tuple[int, bool]]  # (page_index, equal_to_reference)
+    colcount_equality_by_page: List[Tuple[int, bool]]
+
+
+# =========================
+# Config
+# =========================
+
+@dataclass
+class PatternAConfig:
+    # Grid regularity thresholds
+    max_row_colcount_deviation_ratio: float = 0.2  # <= 20% of data rows can deviate from mode
+    min_data_rows_for_analysis: int = 5
+
+    # Body merges allowance (strict)
+    max_body_merged_anchors: int = 0
+
+    # Document-level strictness
+    require_header_on_every_page: bool = True
+    require_exact_header_equality_across_pages: bool = True
+    require_equal_data_mode_cols_across_pages: bool = True
+
+
+# =========================
+# Utilities
+# =========================
+
+def _squeeze(s: str) -> str:
+    return " ".join((s or "").split())
+
+def _nonempty_count(row: List[Any]) -> int:
+    return sum(1 for x in row if _squeeze(str(x)) != "")
+
+def _mode(values: List[int]) -> int:
+    if not values:
+        return 0
+    from collections import Counter
+    return Counter(values).most_common(1)[0][0]
+
+def _extract_header_names_raw(df: pd.DataFrame, header_rows: List[int], header_names: Optional[List[str]]) -> List[str]:
+    # If caller already supplied header_names (built from header rows), use them as-is
+    if header_names:
+        return [str(x) for x in header_names]
+    # Else pick the last header row as the basis for column names
+    if header_rows:
+        last_idx = header_rows[-1]
+        if 0 <= last_idx < len(df):
+            return [ _squeeze(str(x)) for x in df.iloc[last_idx].tolist() ]
+    # Fallback: use DataFrame column indices
+    return [str(c) for c in range(df.shape[1])]
+
+def _compute_data_start_row(header_rows: List[int]) -> int:
+    return (max(header_rows) + 1) if header_rows else 0
+
+def _count_body_merged_anchors(merged_cells: Optional[List[Dict[str, Any]]], data_start_row_0based: int) -> int:
+    # merged_cells row_index is 1-based; convert to 0-based to compare with data_start_row
+    if not merged_cells:
+        return 0
+    count = 0
+    for m in merged_cells:
+        r = int(m.get("row_index") or m.get("RowIndex") or 1)
+        r0 = r - 1
+        rs = int(m.get("row_span") or m.get("RowSpan") or 1)
+        cs = int(m.get("column_span") or m.get("ColumnSpan") or 1)
+        # Only count anchors (top-left merged cell); AWS usually gives spans on that anchor
+        if r0 >= data_start_row_0based and (rs > 1 or cs > 1):
+            count += 1
+    return count
+
+def _analyze_data_region(df: pd.DataFrame, data_start_row: int) -> Tuple[int, int, float, List[int]]:
+    """
+    Returns:
+      data_rows_count, data_mode_cols, row_colcount_variance_ratio, per_row_nonempty_counts
+    """
+    if df.empty or data_start_row >= len(df):
+        return 0, 0, 0.0, []
+
+    nonempty_counts: List[int] = []
+    for i in range(data_start_row, len(df)):
+        row = df.iloc[i].tolist()
+        nonempty_counts.append(_nonempty_count(row))
+
+    # Ignore completely empty trailing rows from analysis (footers/notes often empty)
+    analyzed = [c for c in nonempty_counts if c > 0]
+    data_rows_count = len(analyzed)
+    if data_rows_count == 0:
+        return 0, 0, 0.0, nonempty_counts
+
+    m = _mode(analyzed)
+    deviations = sum(1 for c in analyzed if c != m)
+    variance_ratio = deviations / data_rows_count
+    return data_rows_count, m, variance_ratio, nonempty_counts
+
+
+# =========================
+# Page-level Pattern A
+# =========================
+
+def extract_table_a_features(table: TableInput, cfg: PatternAConfig) -> TableAFeatures:
+    df = table.df
+    hi = table.header_info or HeaderInfo(header_row_indices=[], header_valid=False, header_names=None)
+
+    has_header = bool(hi.header_row_indices) and hi.header_valid
+    header_rows = hi.header_row_indices if has_header else []
+    header_names_raw = _extract_header_names_raw(df, header_rows, hi.header_names if has_header else None)
+    header_cols_count = len(header_names_raw) if has_header else 0
+
+    data_start_row = _compute_data_start_row(header_rows)
+    data_rows_count, data_mode_cols, variance_ratio, per_row_counts = _analyze_data_region(df, data_start_row)
+    body_merged_anchors = _count_body_merged_anchors(table.merged_cells, data_start_row)
+
+    reasons: List[str] = []
+    if has_header:
+        reasons.append("Header detected and valid.")
+    else:
+        reasons.append("Header missing or invalid.")
+
+    if data_rows_count >= cfg.min_data_rows_for_analysis:
+        reasons.append(f"Data rows sufficient ({data_rows_count} rows).")
+    else:
+        reasons.append(f"Few data rows ({data_rows_count} < {cfg.min_data_rows_for_analysis}).")
+
+    reasons.append(f"Data mode non-empty cols = {data_mode_cols}. Variance ratio = {variance_ratio:.2f}.")
+    if variance_ratio <= cfg.max_row_colcount_deviation_ratio:
+        reasons.append("Grid regularity OK.")
+    else:
+        reasons.append("Grid irregular (too many rows deviate from mode).")
+
+    reasons.append(f"Body merged anchors = {body_merged_anchors}.")
+    if body_merged_anchors <= cfg.max_body_merged_anchors:
+        reasons.append("No body merges (OK).")
+    else:
+        reasons.append("Found body merges (not allowed for Type A).")
+
+    # Consistency between header and data cols (soft check; some rows may be sparse)
+    if has_header and data_mode_cols > 0:
+        if data_mode_cols == header_cols_count:
+            reasons.append("Header column count matches data mode column count.")
+        else:
+            reasons.append("Header column count differs from data mode column count.")
+
+    return TableAFeatures(
+        has_header=has_header,
+        header_rows=header_rows,
+        header_names_raw=header_names_raw,
+        header_cols_count=header_cols_count,
+        data_start_row=data_start_row,
+        data_rows_count=data_rows_count,
+        data_mode_cols=data_mode_cols,
+        row_colcount_variance_ratio=variance_ratio,
+        body_merged_anchors=body_merged_anchors,
+        reasons=reasons,
+    )
+
+def classify_page_pattern_a(table: TableInput, cfg: Optional[PatternAConfig] = None) -> PageAPatternResult:
+    cfg = cfg or PatternAConfig()
+    feats = extract_table_a_features(table, cfg)
+
+    is_grid_regular = feats.row_colcount_variance_ratio <= cfg.max_row_colcount_deviation_ratio
+    has_enough_rows = feats.data_rows_count >= cfg.min_data_rows_for_analysis
+    no_body_merges = feats.body_merged_anchors <= cfg.max_body_merged_anchors
+    header_data_col_match = True
+    if feats.has_header and feats.data_mode_cols > 0:
+        header_data_col_match = (feats.header_cols_count == feats.data_mode_cols)
+
+    # Base decision
+    is_type_a = (
+        feats.has_header and
+        is_grid_regular and
+        no_body_merges and
+        has_enough_rows and
+        header_data_col_match
+    )
+
+    # Confidence scoring (simple, explainable)
+    confidence = 1.0
+    if not feats.has_header:
+        confidence -= 0.4
+    if not is_grid_regular:
+        confidence -= 0.3
+    if not no_body_merges:
+        confidence -= 0.2
+    if not has_enough_rows:
+        confidence -= 0.1
+    if feats.has_header and not header_data_col_match:
+        confidence -= 0.1
+
+    confidence = max(0.0, min(1.0, confidence))
+
+    reasons = list(feats.reasons)
+    if is_type_a:
+        reasons.insert(0, "Classified as Type A (fully structured).")
+    else:
+        reasons.insert(0, "Not Type A.")
+
+    return PageAPatternResult(
+        page_index=table.page_index,
+        table_index_on_page=table.table_index_on_page,
+        is_type_a=is_type_a,
+        confidence=confidence,
+        reasons=reasons,
+        features=feats,
+    )
+
+# =========================
+# Document-level Pattern A
+# =========================
+
+def classify_document_pattern_a(
+    tables: List[TableInput],
+    cfg: Optional[PatternAConfig] = None
+) -> DocumentAResult:
+    """
+    Classify an entire document as Pattern A (Fully Structured) or not, based on:
+      - All pages classified as Type A at page-level
+      - Optional strictness: header on every page, exact same header names on all pages,
+        and equal modal data columns across pages
+
+    Returns a DocumentAResult with page results, reference header, equality checks, and reasons.
+    """
+    cfg = cfg or PatternAConfig()
+
+    if not tables:
+        return DocumentAResult(
+            is_type_a_document=False,
+            confidence=0.0,
+            page_results=[],
+            reference_page_index=None,
+            reference_headers=None,
+            reasons=["No tables provided."],
+            header_equality_by_page=[],
+            colcount_equality_by_page=[],
+        )
+
+    # Page-level classification
+    page_results: List[PageAPatternResult] = [classify_page_pattern_a(t, cfg) for t in tables]
+
+    # Pick reference: first page that has a header
+    reference_idx: Optional[int] = None
+    reference_headers: Optional[List[str]] = None
+    reference_mode_cols: Optional[int] = None
+
+    for pr in page_results:
+        if pr.features.has_header:
+            reference_idx = pr.page_index
+            reference_headers = pr.features.header_names_raw
+            reference_mode_cols = pr.features.data_mode_cols
+            break
+
+    reasons: List[str] = []
+    header_equality_by_page: List[Tuple[int, bool]] = []
+    colcount_equality_by_page: List[Tuple[int, bool]] = []
+
+    all_pages_type_a = all(pr.is_type_a for pr in page_results)
+    if all_pages_type_a:
+        reasons.append("All pages classified as Type A at page-level.")
+    else:
+        reasons.append("Not all pages are Type A at page-level.")
+
+    # Check headers on every page if required
+    headers_on_every_page = all(pr.features.has_header for pr in page_results)
+    if cfg.require_header_on_every_page:
+        if headers_on_every_page:
+            reasons.append("Headers present on every page (required).")
+        else:
+            reasons.append("Missing headers on some pages (required for Type A document).")
+    else:
+        reasons.append("Header presence on every page not required by config.")
+
+    # Header equality across pages (exact, no normalization)
+    headers_equal_all = True
+    if cfg.require_exact_header_equality_across_pages:
+        if reference_headers is None:
+            headers_equal_all = False
+            reasons.append("No reference header found; cannot enforce exact header equality.")
+        else:
+            for pr in page_results:
+                eq = pr.features.has_header and (pr.features.header_names_raw == reference_headers)
+                header_equality_by_page.append((pr.page_index, eq))
+                if not eq:
+                    headers_equal_all = False
+            if headers_equal_all:
+                reasons.append("Exact header names match across all pages (required).")
+            else:
+                reasons.append("Header names differ on some pages (required exact match).")
+    else:
+        reasons.append("Exact header equality across pages not required by config.")
+        # Still populate diagnostics if reference exists
+        if reference_headers is not None:
+            for pr in page_results:
+                eq = pr.features.has_header and (pr.features.header_names_raw == reference_headers)
+                header_equality_by_page.append((pr.page_index, eq))
+
+    # Data mode column count equality across pages
+    colcount_equal_all = True
+    if cfg.require_equal_data_mode_cols_across_pages:
+        if reference_mode_cols is None:
+            colcount_equal_all = False
+            reasons.append("No reference data mode column count; cannot enforce equal column counts.")
+        else:
+            for pr in page_results:
+                eq = (pr.features.data_mode_cols == reference_mode_cols)
+                colcount_equality_by_page.append((pr.page_index, eq))
+                if not eq:
+                    colcount_equal_all = False
+            if colcount_equal_all:
+                reasons.append("Data mode column count matches across all pages (required).")
+            else:
+                reasons.append("Data mode column count differs on some pages (required match).")
+    else:
+        reasons.append("Equal data mode column counts not required by config.")
+        if reference_mode_cols is not None:
+            for pr in page_results:
+                eq = (pr.features.data_mode_cols == reference_mode_cols)
+                colcount_equality_by_page.append((pr.page_index, eq))
+
+    # Final document-level decision
+    is_doc_type_a = all_pages_type_a
+    if cfg.require_header_on_every_page:
+        is_doc_type_a = is_doc_type_a and headers_on_every_page
+    if cfg.require_exact_header_equality_across_pages:
+        is_doc_type_a = is_doc_type_a and headers_equal_all
+    if cfg.require_equal_data_mode_cols_across_pages:
+        is_doc_type_a = is_doc_type_a and colcount_equal_all
+
+    # Confidence: start from average page confidence, subtract penalties for doc-level violations
+    avg_page_conf = sum(pr.confidence for pr in page_results) / len(page_results)
+    penalty = 0.0
+    if cfg.require_header_on_every_page and not headers_on_every_page:
+        penalty += 0.25
+    if cfg.require_exact_header_equality_across_pages and not headers_equal_all:
+        penalty += 0.25
+    if cfg.require_equal_data_mode_cols_across_pages and not colcount_equal_all:
+        penalty += 0.2
+    if not all_pages_type_a:
+        penalty += 0.2
+
+    doc_confidence = max(0.0, min(1.0, avg_page_conf - penalty))
+    if is_doc_type_a:
+        reasons.insert(0, "Document classified as Type A (fully structured across pages).")
+    else:
+        reasons.insert(0, "Document not classified as Type A.")
+
+    return DocumentAResult(
+        is_type_a_document=is_doc_type_a,
+        confidence=doc_confidence,
+        page_results=page_results,
+        reference_page_index=reference_idx,
+        reference_headers=reference_headers,
+        reasons=reasons,
+        header_equality_by_page=header_equality_by_page,
+        colcount_equality_by_page=colcount_equality_by_page,
+    )
+
+# input
+cfg = PatternAConfig()
+doc_result = classify_document_pattern_a(tables, cfg)
+
+print(doc_result.is_type_a_document, round(doc_result.confidence, 3))
+for pr in doc_result.page_results:
+    print(f"Page {pr.page_index} -> Type A: {pr.is_type_a}, conf={round(pr.confidence,3)}")
