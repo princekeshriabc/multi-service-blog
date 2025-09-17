@@ -1,1137 +1,102 @@
-# What you get in memory
-
-# A list called tables. One entry per TABLE block found by Textract. Each entry is a dict with:
-# page: Page number the table is on.
-# confidence: Textract’s confidence for the table block (if present).
-# bbox and polygon: The table’s bounding box and polygon (normalized 0–1 coordinates).
-# matrix: A 2D list of strings representing the table as rows and columns.
-# Merged cells: the text is placed in the top-left anchor cell; the other merged positions are left empty.
-# cells: A list of cell dicts with rich metadata:
-# row_index, column_index: 1-based indices.
-# row_span, column_span: spans for merged cells.
-# text: concatenated WORDs (and [x]/[ ] for checkboxes).
-# confidence: Textract’s confidence for the cell.
-# bbox, polygon: cell geometry (normalized 0–1).
-# What gets written to disk
-
-# One CSV per table using matrix only:
-# File name: page_{page}table{i}.csv in the out_dir you pass.
-# Each CSV row equals one table row; each column equals one table column.
-# Quick example of what tables[0] might look like
-
-# tables[0]["page"] -> 1
-# tables[0]["matrix"] -> [
-# ["Date of Service", "CPT", "Units", "Charge", "Patient Resp"],
-# ["01/12/2024", "99213", "1", "
-# 150.00
-# "
-# ,
-# "
-# 150.00","30.00"],
-# ...
-# ]
-# tables[0]["cells"][0] -> {
-# "row_index": 1,
-# "column_index": 1,
-# "row_span": 1,
-# "column_span": 1,
-# "text": "Date of Service",
-# "confidence": 98.3,
-# "bbox": {"Left": 0.12, "Top": 0.18, "Width": 0.15, "Height": 0.02},
-# "polygon": [...]
-# }
-# Notes
-
-# Coordinates (bbox/polygon) are relative to the page (0–1). Convert to pixels/points by multiplying by page width/height if needed.
-# Checkboxes in cells appear as “[x]” or “[ ]”.
-# If Textract finds no tables, tables = [] and no CSVs are written.
-# The CSVs only include text; if you need geometry/confidence exported too, you can dump tables to a JSON file or build a custom CSV writer for the cells list.
-# How to see it quickly
-
-# After running:
-# print(len(tables)) # number of tables
-# print(tables[0]["page"], len(tables[0]["matrix"]), len(tables[0]["matrix"][0])) # page, row count, column count
-# print(tables[0]["cells"][0]) # first cell’s metadata and text
-
-import json
-from typing import List, Dict, Any, Tuple, Optional
-import csv
-import os
-
-def load_textract_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def build_block_map(blocks: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {b["Id"]: b for b in blocks}
-
-def get_text_from_block(block: Dict[str, Any], block_map: Dict[str, Dict[str, Any]]) -> str:
-    # Concatenate WORDs and handle checkboxes (SELECTION_ELEMENT)
-    texts = []
-    for rel in block.get("Relationships", []):
-        if rel["Type"] == "CHILD":
-            for cid in rel["Ids"]:
-                child = block_map.get(cid)
-                if not child:
-                    continue
-                if child["BlockType"] == "WORD":
-                    texts.append(child["Text"])
-                elif child["BlockType"] == "SELECTION_ELEMENT":
-                    status = child.get("SelectionStatus", "NOT_SELECTED")
-                    texts.append("[x]" if status == "SELECTED" else "[ ]")
-    return " ".join(texts).strip()
-
-def extract_table_cells(
-    table_block: Dict[str, Any],
-    block_map: Dict[str, Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    cell_ids = []
-    for rel in table_block.get("Relationships", []):
-        if rel["Type"] == "CHILD":
-            cell_ids.extend(rel["Ids"])
-    cells = []
-    for cid in cell_ids:
-        cell = block_map.get(cid)
-        if not cell or cell["BlockType"] not in ("CELL", "MERGED_CELL"):
-            continue
-        cell_text = get_text_from_block(cell, block_map)
-        cells.append({
-            "row_index": cell.get("RowIndex", 1),
-            "column_index": cell.get("ColumnIndex", 1),
-            "row_span": cell.get("RowSpan", 1),
-            "column_span": cell.get("ColumnSpan", 1),
-            "text": cell_text,
-            "confidence": cell.get("Confidence"),
-            "bbox": cell.get("Geometry", {}).get("BoundingBox"),
-            "polygon": cell.get("Geometry", {}).get("Polygon"),
-        })
-    return cells
-
-def build_table_matrix(cells: List[Dict[str, Any]]) -> List[List[str]]:
-    if not cells:
-        return []
-    max_row = 0
-    max_col = 0
-    for c in cells:
-        max_row = max(max_row, c["row_index"] + c["row_span"] - 1)
-        max_col = max(max_col, c["column_index"] + c["column_span"] - 1)
-    matrix = [["" for _ in range(max_col)] for _ in range(max_row)]
-    # Place text; for merged cells, put text in the top-left anchored cell
-    for c in cells:
-        r0 = c["row_index"] - 1
-        c0 = c["column_index"] - 1
-        for dr in range(c["row_span"]):
-            for dc in range(c["column_span"]):
-                rr = r0 + dr
-                cc = c0 + dc
-                if dr == 0 and dc == 0:
-                    matrix[rr][cc] = c["text"]
-                else:
-                    # Optional: mark merged positions or leave empty
-                    if not matrix[rr][cc]:
-                        matrix[rr][cc] = ""
-    return matrix
-
-def extract_tables(textract_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-    blocks = textract_json.get("Blocks", [])
-    block_map = build_block_map(blocks)
-    tables = []
-    for b in blocks:
-        if b["BlockType"] == "TABLE":
-            cells = extract_table_cells(b, block_map)
-            matrix = build_table_matrix(cells)
-            tables.append({
-                "page": b.get("Page"),
-                "confidence": b.get("Confidence"),
-                "bbox": b.get("Geometry", {}).get("BoundingBox"),
-                "polygon": b.get("Geometry", {}).get("Polygon"),
-                "cells": cells,
-                "matrix": matrix,
-            })
-    return tables
-
-def save_tables_to_csv(tables: List[Dict[str, Any]], out_dir: str) -> None:
-    os.makedirs(out_dir, exist_ok=True)
-    for i, t in enumerate(tables, start=1):
-        page = t.get("page", "unknown")
-        path = os.path.join(out_dir, f"page_{page}_table_{i}.csv")
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            for row in t["matrix"]:
-                writer.writerow(row)
-
-# Example usage:
-# data = load_textract_json("textract_output.json")
-# tables = extract_tables(data)
-# save_tables_to_csv(tables, "./tables_out")
-# Now you also have rich metadata in tables[i]["cells"].
-
-# Great question. You can detect merged cells in Textract tables by checking either:
-
-# RowSpan > 1 or ColumnSpan > 1 on CELL blocks, and/or
-# BlockType == "MERGED_CELL" (when present).
-# Below are small additions to your current code to:
-
-# Capture the block type for each cell.
-# Compute which grid positions a merged cell covers.
-# Extract only merged-cell info per table.
-# Optionally detect header-merged cells (likely in the top of the table).
-# Additions/changes to your code
-
-# Keep the block type and the block Id for each cell:
-# Update extract_table_cells to include block_type and id.
-# Utility to list merged cells and the positions they cover:
-# A merged cell is one where row_span > 1 or column_span > 1, or block_type == "MERGED_CELL".
-# Optional: flag merged cells that are likely headers:
-# Consider cells in the first table row(s) or within the top X% of the table’s bounding box.
-# Code snippets (drop-in additions)
-
-# Replace your extract_table_cells with this version to include block_type and id:
-
-def extract_table_cells(
-    table_block: Dict[str, Any],
-    block_map: Dict[str, Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    cell_ids = []
-    for rel in table_block.get("Relationships", []):
-        if rel["Type"] == "CHILD":
-            cell_ids.extend(rel["Ids"])
-    cells = []
-    for cid in cell_ids:
-        cell = block_map.get(cid)
-        if not cell or cell["BlockType"] not in ("CELL", "MERGED_CELL"):
-            continue
-        cell_text = get_text_from_block(cell, block_map)
-        cells.append({
-            "id": cell.get("Id"),
-            "block_type": cell.get("BlockType"),
-            "row_index": cell.get("RowIndex", 1),
-            "column_index": cell.get("ColumnIndex", 1),
-            "row_span": cell.get("RowSpan", 1),
-            "column_span": cell.get("ColumnSpan", 1),
-            "text": cell_text,
-            "confidence": cell.get("Confidence"),
-            "bbox": cell.get("Geometry", {}).get("BoundingBox"),
-            "polygon": cell.get("Geometry", {}).get("Polygon"),
-        })
-    return cells
-
-# Add helpers to find merged cells and compute covered positions:
-
-def covered_positions(cell: Dict[str, Any]) -> List[Tuple[int, int]]:
-    # Returns 1-based (row, col) positions covered by this cell’s span
-    positions = []
-    for r in range(cell["row_index"], cell["row_index"] + cell["row_span"]):
-        for c in range(cell["column_index"], cell["column_index"] + cell["column_span"]):
-            positions.append((r, c))
-    return positions
-
-def get_merged_cells_from_table(table: Dict[str, Any]) -> List[Dict[str, Any]]:
-    merged = []
-    for c in table["cells"]:
-        is_merged = (c["row_span"] > 1 or c["column_span"] > 1 or c.get("block_type") == "MERGED_CELL")
-        if is_merged:
-            mc = dict(c)
-            mc["covers"] = covered_positions(c)  # list of (row, col)
-            merged.append(mc)
-    return merged
-
-# Optional: identify merged header cells
-
-# Heuristics: merged cells in the first row(s) or within the top 15–20% of the table height.
-
-def is_probable_header_merged_cell(merged_cell: Dict[str, Any], table: Dict[str, Any], top_fraction: float = 0.2) -> bool:
-    # Row-based heuristic
-    if merged_cell["row_index"] <= 2:
-        return True
-    # Geometry-based heuristic (uses normalized coordinates)
-    table_bbox = table.get("bbox") or {}
-    cell_bbox = merged_cell.get("bbox") or {}
-    if not table_bbox or not cell_bbox:
-        return False
-    if table_bbox.get("Height", 0) <= 0:
-        return False
-    rel_top = (cell_bbox["Top"] - table_bbox["Top"]) / table_bbox["Height"]
-    return rel_top <= top_fraction
-
-# exmaple usage
-data = load_textract_json("textract_output.json")
-tables = extract_tables(data)
-
-for ti, t in enumerate(tables, start=1):
-    merged_cells = get_merged_cells_from_table(t)
-    print(f"Table #{ti} on page {t.get('page')}: {len(merged_cells)} merged cell(s)")
-
-    # Print merged cell info
-    for m in merged_cells:
-        print(
-            f"  Anchor (r{m['row_index']}, c{m['column_index']}), "
-            f"span r{m['row_span']} x c{m['column_span']}, "
-            f"text='{m['text']}', covers={m['covers']}"
-        )
-
-    # If you only want header-merged cells:
-    header_merged = [m for m in merged_cells if is_probable_header_merged_cell(m, t)]
-    print(f"  Header-like merged cells: {len(header_merged)}")
-
-# What you’ll get for a typical header merge
-
-# For a header like “Service Details” that spans columns 1–3 on the first row:
-# row_index=1, column_index=1, row_span=1, column_span=3
-# covers=[(1,1), (1,2), (1,3)]
-# text="Service Details"
-# block_type might be "CELL" or "MERGED_CELL" depending on what Textract emitted.
-# Notes and tips
-
-# Textract does not explicitly label “header” cells; you must infer them with row index or geometry.
-# Some outputs include MERGED_CELL blocks without text; the text is typically associated with the CELL at the top-left anchor. The RowSpan/ColumnSpan approach is the most reliable.
-# If you need only merged cells across all tables, just collect get_merged_cells_from_table(t) for each t and ignore t["matrix"].
-# For auditing, you can export merged cell metadata to a CSV: page, table_index, anchor_row, anchor_col, row_span, col_span, text, confidence.
-
-Add these helpers
-def covered_positions(cell):
-positions = []
-for r in range(cell["row_index"], cell["row_index"] + cell["row_span"]):
-for c in range(cell["column_index"], cell["column_index"] + cell["column_span"]):
-positions.append((r, c))
-return positions
-def get_merged_cells_from_table(table):
-merged = []
-for c in table["cells"]:
-if c.get("row_span", 1) > 1 or c.get("column_span", 1) > 1 or c.get("block_type") == "MERGED_CELL":
-mc = dict(c)
-mc["covers"] = covered_positions(c)
-merged.append(mc)
-return merged
-
-def export_merged_cells_csv(tables, out_path):
-from collections import defaultdict
-page_counts = defaultdict(int)
-with open(out_path, "w", newline="", encoding="utf-8") as f:
-writer = csv.writer(f)
-writer.writerow([
-"page", "table_global_index", "table_index_on_page",
-"anchor_row", "anchor_col", "row_span", "col_span",
-"text", "confidence", "covers"
-])
-for gi, t in enumerate(tables, start=1):
-page = t.get("page")
-page_counts[page] += 1
-on_page_idx = page_counts[page]
-merged_cells = get_merged_cells_from_table(t)
-for m in merged_cells:
-covers_str = ";".join([f"{r}:{c}" for (r, c) in m["covers"]])
-writer.writerow([
-page, gi, on_page_idx,
-m.get("row_index"), m.get("column_index"),
-m.get("row_span", 1), m.get("column_span", 1),
-m.get("text", ""), m.get("confidence", ""),
-covers_str
-])
-
-# Nice work. Two key points now:
-
-# CSV can’t preserve merged cells. You won’t be able to detect merges from CSV alone.
-# You already have merge info in the parsed tables (row_span/column_span, and sometimes BlockType == MERGED_CELL). Use that to export a “merged-cells summary” or write an Excel file with real merged ranges.
-# Below are drop-in helpers to:
-
-# Produce a merged-cells-only CSV across all tables.
-# Write an Excel workbook that visually preserves merges.
-# If your current cell dicts don’t include block_type/id, they’re optional; merges are determined by row_span/column_span.
-
-# Export a merged-cells summary CSV
-# Each row = one merged cell (anchor position + span + text) for every table.
-# Requirements: none (uses Python stdlib).
-
-merged_csv_path = "merged_cells_summary.csv"
-export_merged_cells_csv(tables, merged_csv_path)
-
-# Write an Excel workbook with real merged ranges
-# This preserves the visual layout of merged headers and cells.
-# Requirements:
-
-# pip install openpyxl
-# Code:
-def save_tables_to_excel_with_merges(tables, out_xlsx):
-from collections import defaultdict
-from openpyxl import Workbook
-from openpyxl.styles import Alignment
-
-wb = Workbook()
-# remove default sheet
-default_sheet = wb.active
-wb.remove(default_sheet)
-
-page_counts = defaultdict(int)
-
-for gi, t in enumerate(tables, start=1):
-    page = t.get("page")
-    page_counts[page] += 1
-    on_page_idx = page_counts[page]
-
-    # Sheet name max 31 chars
-    sheet_name = f"p{page}_t{on_page_idx}"
-    sheet_name = sheet_name[:31]
-    ws = wb.create_sheet(title=sheet_name)
-
-    # Write matrix text first
-    matrix = t.get("matrix", [])
-    for row in matrix:
-        ws.append(row)
-
-    # Apply merged ranges
-    merged_cells = get_merged_cells_from_table(t)
-    for m in merged_cells:
-        r1 = int(m["row_index"])
-        c1 = int(m["column_index"])
-        r2 = r1 + int(m.get("row_span", 1)) - 1
-        c2 = c1 + int(m.get("column_span", 1)) - 1
-        if r2 > r1 or c2 > c1:
-            ws.merge_cells(start_row=r1, start_column=c1, end_row=r2, end_column=c2)
-            # Optional: center + wrap
-            cell = ws.cell(row=r1, column=c1)
-            cell.alignment = Alignment(vertical="center", horizontal="center", wrap_text=True)
-
-wb.save(out_xlsx)
-
-save_tables_to_excel_with_merges(tables, "textract_tables_with_merges.xlsx")
-
-# How to use with what you have now
-
-# If you still have the tables variable in memory from parsing Textract JSON: call export_merged_cells_csv and/or save_tables_to_excel_with_merges directly.
-# If you only saved CSVs and discarded the tables variable, you cannot recover merges from CSVs. Re-run your parser on the same Textract JSON to get tables again, then export merges.
-# Optional: detect header-merged cells only
-
-# Simple heuristic: merged cells in the first 1–2 rows of the table.
-def merged_header_cells_only(table, max_header_rows=2):
-merged = get_merged_cells_from_table(table)
-return [m for m in merged if m["row_index"] <= max_header_rows]
-
-# Below is a complete, ready-to-run toolkit that will:
-
-# Parse Textract JSON and extract all tables across pages.
-# Capture full cell metadata (row/col, spans, confidence, geometry).
-# Identify all merged cells (including header merges).
-# Export per-table CSVs (text only), a merged-cells summary CSV, a JSON metadata dump, and an Excel workbook that visually preserves merged ranges.
-# What you’ll need
-
-# Python 3.8+ (3.10+ recommended)
-# pip install openpyxl
-# Your Textract JSON output file(s)
-# Single-file script (save as textract_tables_tool.py)
-
-# Supports a single JSON file or a directory of multiple Textract JSONs (e.g., async job pages). It merges blocks from all files automatically.
-
-import argparse
-import csv
-import json
-import os
-from typing import List, Dict, Any, Tuple
-
-# =========================
-# Loading and parsing JSON
-# =========================
-
-def load_textract_json_any(path: str) -> Dict[str, Any]:
-    """
-    Load a Textract JSON. If path is a directory, merge all *.json files (concatenate Blocks).
-    Returns a dict with a single 'Blocks' list, which works for both sync and async outputs.
-    """
-    if os.path.isdir(path):
-        blocks = []
-        for fname in sorted(os.listdir(path)):
-            if not fname.lower().endswith(".json"):
-                continue
-            fpath = os.path.join(path, fname)
-            with open(fpath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                blocks.extend(data.get("Blocks", []))
-        return {"Blocks": blocks}
-    else:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # Normalize to a dict with Blocks
-        if isinstance(data, dict) and "Blocks" in data:
-            return data
-        elif isinstance(data, list):
-            # Some people store blocks directly as a list
-            return {"Blocks": data}
-        else:
-            raise ValueError("Input JSON does not look like a Textract response (missing 'Blocks').")
-
-def build_block_map(blocks: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {b.get("Id"): b for b in blocks if "Id" in b}
-
-def get_text_from_block(block: Dict[str, Any], block_map: Dict[str, Dict[str, Any]]) -> str:
-    texts = []
-    for rel in block.get("Relationships", []):
-        if rel.get("Type") == "CHILD":
-            for cid in rel.get("Ids", []):
-                child = block_map.get(cid)
-                if not child:
-                    continue
-                bt = child.get("BlockType")
-                if bt == "WORD":
-                    texts.append(child.get("Text", ""))
-                elif bt == "SELECTION_ELEMENT":
-                    status = child.get("SelectionStatus", "NOT_SELECTED")
-                    texts.append("[x]" if status == "SELECTED" else "[ ]")
-    return " ".join(t for t in texts if t).strip()
-
-def extract_table_cells(table_block: Dict[str, Any], block_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cell_ids = []
-    for rel in table_block.get("Relationships", []):
-        if rel.get("Type") == "CHILD":
-            cell_ids.extend(rel.get("Ids", []))
-    cells = []
-    for cid in cell_ids:
-        cell = block_map.get(cid)
-        if not cell or cell.get("BlockType") not in ("CELL", "MERGED_CELL"):
-            continue
-        cell_text = get_text_from_block(cell, block_map)
-        cells.append({
-            "id": cell.get("Id"),
-            "block_type": cell.get("BlockType"),
-            "row_index": int(cell.get("RowIndex", 1)),
-            "column_index": int(cell.get("ColumnIndex", 1)),
-            "row_span": int(cell.get("RowSpan", 1)),
-            "column_span": int(cell.get("ColumnSpan", 1)),
-            "text": cell_text,
-            "confidence": cell.get("Confidence"),
-            "bbox": (cell.get("Geometry", {}) or {}).get("BoundingBox"),
-            "polygon": (cell.get("Geometry", {}) or {}).get("Polygon"),
-        })
-    return cells
-
-def build_table_matrix(cells: List[Dict[str, Any]]) -> List[List[str]]:
-    if not cells:
-        return []
-    max_row = 0
-    max_col = 0
-    for c in cells:
-        max_row = max(max_row, c["row_index"] + c["row_span"] - 1)
-        max_col = max(max_col, c["column_index"] + c["column_span"] - 1)
-    matrix = [["" for _ in range(max_col)] for _ in range(max_row)]
-    # place text; merged text goes to top-left anchor cell
-    for c in cells:
-        r0 = c["row_index"] - 1
-        c0 = c["column_index"] - 1
-        for dr in range(c["row_span"]):
-            for dc in range(c["column_span"]):
-                rr = r0 + dr
-                cc = c0 + dc
-                if dr == 0 and dc == 0:
-                    matrix[rr][cc] = c["text"]
-                else:
-                    if not matrix[rr][cc]:
-                        matrix[rr][cc] = ""
-    return matrix
-
-def extract_tables(textract_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-    blocks = textract_json.get("Blocks", [])
-    block_map = build_block_map(blocks)
-    tables = []
-    for b in blocks:
-        if b.get("BlockType") == "TABLE":
-            cells = extract_table_cells(b, block_map)
-            matrix = build_table_matrix(cells)
-            tables.append({
-                "page": b.get("Page"),
-                "confidence": b.get("Confidence"),
-                "bbox": (b.get("Geometry", {}) or {}).get("BoundingBox"),
-                "polygon": (b.get("Geometry", {}) or {}).get("Polygon"),
-                "cells": cells,
-                "matrix": matrix,
-            })
-    annotate_table_indices(tables)
-    return tables
-
-def annotate_table_indices(tables: List[Dict[str, Any]]) -> None:
-    # Adds table indices to each table dict: global_index and index_on_page
-    page_counts = {}
-    for i, t in enumerate(tables, start=1):
-        t["global_index"] = i
-        page = t.get("page")
-        page_counts[page] = page_counts.get(page, 0) + 1
-        t["index_on_page"] = page_counts[page]
-
-# =========================
-# Merged cell utilities
-# =========================
-
-def covered_positions(cell: Dict[str, Any]) -> List[Tuple[int, int]]:
-    pos = []
-    for r in range(cell["row_index"], cell["row_index"] + cell["row_span"]):
-        for c in range(cell["column_index"], cell["column_index"] + cell["column_span"]):
-            pos.append((r, c))
-    return pos
-
-def get_merged_cells_from_table(table: Dict[str, Any]) -> List[Dict[str, Any]]:
-    merged = []
-    for c in table.get("cells", []):
-        if c.get("row_span", 1) > 1 or c.get("column_span", 1) > 1 or c.get("block_type") == "MERGED_CELL":
-            mc = dict(c)
-            mc["covers"] = covered_positions(c)
-            merged.append(mc)
-    return merged
-
-def merged_header_cells_only(table: Dict[str, Any], max_header_rows: int = 2) -> List[Dict[str, Any]]:
-    merged = get_merged_cells_from_table(table)
-    return [m for m in merged if m["row_index"] <= max_header_rows]
-
-# =========================
-# Exporters
-# =========================
-
-def ensure_outdir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-def save_tables_to_csv(tables: List[Dict[str, Any]], out_dir: str, prefix: str = "") -> None:
-    ensure_outdir(out_dir)
-    for t in tables:
-        page = t.get("page", "unknown")
-        on_page_idx = t.get("index_on_page", t.get("global_index", 0))
-        name = f"{prefix}page_{page}_t{on_page_idx}.csv"
-        path = os.path.join(out_dir, name)
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            for row in t.get("matrix", []):
-                writer.writerow(row)
-
-def export_merged_cells_csv(tables: List[Dict[str, Any]], out_path: str) -> None:
-    ensure_outdir(os.path.dirname(out_path) or ".")
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "page", "table_global_index", "table_index_on_page",
-            "anchor_row", "anchor_col", "row_span", "col_span",
-            "text", "confidence", "covers"
-        ])
-        for t in tables:
-            merged_cells = get_merged_cells_from_table(t)
-            for m in merged_cells:
-                covers_str = ";".join([f"{r}:{c}" for (r, c) in m.get("covers", [])])
-                writer.writerow([
-                    t.get("page"),
-                    t.get("global_index"),
-                    t.get("index_on_page"),
-                    m.get("row_index"),
-                    m.get("column_index"),
-                    m.get("row_span", 1),
-                    m.get("column_span", 1),
-                    m.get("text", ""),
-                    m.get("confidence", ""),
-                    covers_str
-                ])
-
-def dump_tables_metadata_json(tables: List[Dict[str, Any]], out_path: str) -> None:
-    ensure_outdir(os.path.dirname(out_path) or ".")
-    # Everything is JSON-serializable already
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(tables, f, ensure_ascii=False, indent=2)
-
-def save_tables_to_excel_with_merges(tables: List[Dict[str, Any]], out_xlsx: str) -> None:
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment
-
-    wb = Workbook()
-    # Remove default sheet
-    wb.remove(wb.active)
-
-    for t in tables:
-        page = t.get("page")
-        on_page_idx = t.get("index_on_page", t.get("global_index", 0))
-        sheet_name = f"p{page}_t{on_page_idx}"[:31]
-        ws = wb.create_sheet(title=sheet_name)
-
-        # Write matrix
-        matrix = t.get("matrix", [])
-        for row in matrix:
-            ws.append(row)
-
-        # Apply merges
-        for m in get_merged_cells_from_table(t):
-            r1 = int(m["row_index"])
-            c1 = int(m["column_index"])
-            r2 = r1 + int(m.get("row_span", 1)) - 1
-            c2 = c1 + int(m.get("column_span", 1)) - 1
-            if r2 > r1 or c2 > c1:
-                ws.merge_cells(start_row=r1, start_column=c1, end_row=r2, end_column=c2)
-                cell = ws.cell(row=r1, column=c1)
-                cell.alignment = Alignment(vertical="center", horizontal="center", wrap_text=True)
-
-    ensure_outdir(os.path.dirname(out_xlsx) or ".")
-    wb.save(out_xlsx)
-
-# =========================
-# CLI
-# =========================
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Extract tables and merged-cell info from AWS Textract JSON.")
-    p.add_argument("--input", required=True, help="Path to Textract JSON file or directory of JSON files.")
-    p.add_argument("--outdir", default="tables_out", help="Output directory.")
-    p.add_argument("--prefix", default="", help="Filename prefix for CSV exports.")
-    p.add_argument("--csv", action="store_true", help="Write per-table CSV files.")
-    p.add_argument("--excel", action="store_true", help="Write one Excel workbook with real merged ranges.")
-    p.add_argument("--merged-csv", action="store_true", help="Write a merged-cells summary CSV.")
-    p.add_argument("--json", action="store_true", help="Write a JSON metadata dump for all tables.")
-    p.add_argument("--header-rows", type=int, default=2, help="For heuristics when you care about merged headers only.")
-    return p.parse_args()
-
-def main():
-    args = parse_args()
-
-    data = load_textract_json_any(args.input)
-    tables = extract_tables(data)
-
-    if not tables:
-        print("No TABLE blocks found.")
-        return
-
-    # Exports
-    if args.csv:
-        save_tables_to_csv(tables, args.outdir, prefix=args.prefix)
-
-    if args.excel:
-        xlsx_path = os.path.join(args.outdir, f"{args.prefix}textract_tables_with_merges.xlsx")
-        save_tables_to_excel_with_merges(tables, xlsx_path)
-
-    if args.merged_csv:
-        merged_csv_path = os.path.join(args.outdir, f"{args.prefix}merged_cells_summary.csv")
-        export_merged_cells_csv(tables, merged_csv_path)
-
-    if args.json:
-        json_path = os.path.join(args.outdir, f"{args.prefix}tables_metadata.json")
-        dump_tables_metadata_json(tables, json_path)
-
-    # Optional: show header-like merges in console
-    header_counts = []
-    for t in tables:
-        header_merged = merged_header_cells_only(t, max_header_rows=args.header_rows)
-        header_counts.append(len(header_merged))
-    print(f"Extracted {len(tables)} tables across pages. Header-like merged cells per table: {header_counts}")
-
-if __name__ == "__main__":
-    main()
-
-
-# Install
-
-# pip install openpyxl
-# Run examples
-
-# Minimal (per-table CSVs only):
-# python textract_tables_tool.py --input textract_output.json --outdir out --csv
-# Everything (CSV, Excel with merges, merged-cells summary, JSON metadata):
-# python textract_tables_tool.py --input textract_output.json --outdir out --csv --excel --merged-csv --json
-# If you saved multiple Textract JSON files (e.g., async job pages) in a folder:
-# python textract_tables_tool.py --input ./textract_json_shards --outdir out --csv --excel --merged-csv --json
-# What outputs you’ll get
-
-# out/page_{N}_t{K}.csv: One CSV per table (text only).
-# out/textract_tables_with_merges.xlsx: One workbook with a sheet per table, real merged ranges applied.
-# out/merged_cells_summary.csv: One row per merged cell with anchor row/col, row_span, col_span, text, confidence, and covered grid positions.
-# out/tables_metadata.json: Full structured dump including per-cell metadata (row/col, spans, confidence, bbox/polygon).
-# Notes and tips
-
-# CSV does not preserve merged cells; use the merged summary CSV and/or Excel file to retain merge information.
-# Cells are addressed with 1-based indices (Textract standard).
-# Coordinates (bbox/polygon) are normalized 0–1 relative to page. Multiply by page width/height if you need absolute units.
-# To focus only on merged headers, use merged_header_cells_only(table, max_header_rows=2) in custom logic or filter merged_cells_summary.csv by anchor_row <= 2.
-# If you also deal with invoices/expenses, try Textract AnalyzeExpense; but for itemized medical bills, table parsing often gives you complete row structures.
-
-# Got it. Below is a production-style solution to:
-
-# Automatically detect header rows for each table CSV (even when headers span multiple rows).
-# Return how many rows to skip per CSV for concatenation.
-# Optionally use the last header row as column names during concat.
-# Uses dataclasses, typing, and simple, explainable heuristics based on content patterns.
-# Notes
-
-# Since CSVs don’t preserve merges, we infer headers by analyzing the first few rows: headers tend to be text-heavy and/or contain known column keywords; data rows are number/currency/date heavy.
-# If you still have the Textract JSON/tables metadata, you can get perfect header counts (e.g., use row_index <= 2). With CSV alone, heuristics work well for itemized bills.
-# Code (save as detect_csv_headers.py)
-
-# Requires: pip install pandas
-
-from __future__ import annotations
-
-import os
-import re
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional
-
-import pandas as pd
-
-
-@dataclass
-class HeaderDetectConfig:
-    max_scan_rows: int = 4                 # only look at top 4 rows
-    numeric_ratio_threshold: float = 0.5   # >= this => data-like
-    header_numeric_max: float = 0.4        # <= this + text/keywords => header-like
-    min_fill_ratio: float = 0.3            # % of non-empty cells required to trust a header row
-    drop_empty_top_rows: bool = True
-    header_keywords: List[str] = field(default_factory=lambda: [
-        "date", "service", "description", "code", "cpt", "hcpcs", "ndc",
-        "rev", "revenue", "dx", "diagnosis", "modifier", "units", "qty",
-        "quantity", "charge", "amount", "total", "allowed", "payment",
-        "adjustment", "balance", "patient", "responsibility", "account",
-        "claim", "provider", "pos", "rate", "price", "type", "category"
-    ])
-
-
-@dataclass
-class HeaderDetection:
-    header_row_indices: List[int]          # which rows (0-based) in top 4 are headers
-    rows_to_skip: int                      # last header row index + 1, else 0
-    debug: List[Dict] = field(default_factory=list)
-
-
-NUMERIC_RE = re.compile(r"""
-    ^\s*
-    (?:\$)?                           # optional dollar
-    -?                                # optional negative
-    (?:
-        \d{1,3}(?:,\d{3})*(?:\.\d+)?  # 1,234.56
-        |
-        \d+(?:\.\d+)?                 # 123 or 123.45
-    )
-    \s*%?\s*$                         # optional percent
-""", re.X)
-
-DATE_RE = re.compile(r"""
-    ^\s*
-    (?:
-        \d{1,2}[-/]\d{1,2}[-/]\d{2,4}     # 01/31/2024
-        |
-        \d{4}[-/]\d{1,2}[-/]\d{1,2}       # 2024-01-31
-    )
-    \s*$
-""", re.X)
-
-CODE_RE = re.compile(r"^\s*(?:\d{5}|[A-Z]\d{4}|\d{3,4})\s*$", re.I)  # CPT/HCPCS/rev-like
-
-
-def looks_numeric_like(s: str) -> bool:
-    if not s:
-        return False
-    t = s.strip()
-    if not t:
-        return False
-    return bool(NUMERIC_RE.match(t) or DATE_RE.match(t) or CODE_RE.match(t))
-
-
-def contains_alpha(s: str) -> bool:
-    return bool(re.search(r"[A-Za-z]", s or ""))
-
-
-def contains_header_keyword(s: str, keywords: List[str]) -> bool:
-    if not s:
-        return False
-    low = s.lower()
-    return any(k in low for k in keywords)
-
-
-def detect_header_rows_in_top4(csv_path: str, cfg: Optional[HeaderDetectConfig] = None) -> HeaderDetection:
-    cfg = cfg or HeaderDetectConfig()
-
-    # Read only first max_scan_rows rows, no type inference
-    try:
-        head_df = pd.read_csv(
-            csv_path,
-            header=None,
-            nrows=cfg.max_scan_rows,
-            dtype=str,
-            keep_default_na=False,
-            engine="python",
-            on_bad_lines="skip",
-        )
-    except Exception as e:
-        # If the CSV is empty or malformed, return no headers
-        return HeaderDetection(header_row_indices=[], rows_to_skip=0, debug=[{"error": str(e)}])
-
-    if head_df.empty:
-        return HeaderDetection(header_row_indices=[], rows_to_skip=0, debug=[{"note": "empty file"}])
-
-    # Optionally skip leading fully-empty rows
-    start_idx = 0
-    if cfg.drop_empty_top_rows:
-        while start_idx < len(head_df):
-            row_vals = head_df.iloc[start_idx].tolist()
-            if all((str(x).strip() == "" for x in row_vals)):
-                start_idx += 1
-            else:
-                break
-
-    header_rows: List[int] = []
-    first_data_row_idx: Optional[int] = None
-    debug: List[Dict] = []
-
-    # Precompute column count for fill ratio
-    col_count = head_df.shape[1] if head_df.shape[1] > 0 else 1
-
-    for i in range(start_idx, len(head_df)):
-        row = head_df.iloc[i].tolist()
-        stripped = [str(x).strip() for x in row]
-        nonempty_vals = [x for x in stripped if x != ""]
-        nonempty_count = len(nonempty_vals)
-        fill_ratio = (nonempty_count / col_count) if col_count else 0.0
-        numeric_like = sum(1 for x in nonempty_vals if looks_numeric_like(x))
-        alpha_like = sum(1 for x in nonempty_vals if contains_alpha(x))
-        keyword_hits = sum(1 for x in nonempty_vals if contains_header_keyword(x, cfg.header_keywords))
-        total_for_ratio = nonempty_count if nonempty_count else 1
-        numeric_ratio = numeric_like / total_for_ratio
-        alpha_ratio = alpha_like / total_for_ratio
-
-        is_empty = nonempty_count == 0
-        is_data_like = (not is_empty) and (numeric_ratio >= cfg.numeric_ratio_threshold)
-        is_header_like = (
-            not is_empty
-            and fill_ratio >= cfg.min_fill_ratio
-            and numeric_ratio <= cfg.header_numeric_max
-            and (alpha_ratio >= 0.5 or keyword_hits >= 1)
-        )
-
-        debug.append({
-            "row_index": i,
-            "values": row,
-            "nonempty_count": nonempty_count,
-            "fill_ratio": round(fill_ratio, 3),
-            "numeric_like": numeric_like,
-            "alpha_like": alpha_like,
-            "keyword_hits": keyword_hits,
-            "numeric_ratio": round(numeric_ratio, 3),
-            "alpha_ratio": round(alpha_ratio, 3),
-            "is_header_like": is_header_like,
-            "is_data_like": is_data_like,
-            "is_empty": is_empty,
-        })
-
-        # Stop scanning past the configured window (already limited by read_csv)
-        # Mark the first data-like row; header rows must be before it
-        if is_data_like and first_data_row_idx is None:
-            first_data_row_idx = i
-
-    # Decide which rows are headers:
-    # - contiguous block of header-like rows from start_idx up to before first_data_row_idx
-    for d in debug:
-        i = d["row_index"]
-        if i < start_idx:
-            continue
-        if first_data_row_idx is not None and i >= first_data_row_idx:
-            break
-        if d["is_header_like"]:
-            header_rows.append(i)
-        else:
-            # If we haven't seen any header rows yet, keep looking;
-            # once we've collected at least one header row, stop on first non-header row.
-            if header_rows:
-                break
-
-    # Fallbacks:
-    # If we found no header rows but encountered a data row: assume rows before first data row are headers if they are not empty and not ultra-numeric
-    if not header_rows and first_data_row_idx is not None:
-        provisional = []
-        for d in debug:
-            i = d["row_index"]
-            if i < start_idx or i >= first_data_row_idx:
-                continue
-            if (not d["is_empty"]) and (d["numeric_ratio"] <= 0.4):
-                provisional.append(i)
-        header_rows = provisional
-
-    # If still none, default to 1 header row if the very first non-empty row is not numeric-heavy
-    if not header_rows:
-        for d in debug:
-            if d["row_index"] < start_idx:
-                continue
-            if not d["is_empty"] and d["numeric_ratio"] <= 0.4:
-                header_rows = [d["row_index"]]
-                break
-
-    rows_to_skip = (max(header_rows) + 1) if header_rows else 0
-    return HeaderDetection(header_row_indices=header_rows, rows_to_skip=rows_to_skip, debug=debug)
-
-
-# -----------------------------
-# Example usage
-# -----------------------------
-
-if __name__ == "__main__":
-    # Example: run on all CSVs in a folder
-    folder = "tables_out"  # change to your folder with table CSVs
-    cfg = HeaderDetectConfig()
-
-    for fname in sorted(os.listdir(folder)):
-        if not fname.lower().endswith(".csv"):
-            continue
-        fpath = os.path.join(folder, fname)
-        result = detect_header_rows_in_top4(fpath, cfg)
-        print(f"{fname}: header rows={result.header_row_indices}, rows_to_skip={result.rows_to_skip}")
-
-        # Example: read data skipping headers
-        # df = pd.read_csv(fpath, skiprows=result.rows_to_skip, header=None, dtype=str, keep_default_na=False)
-        # ... proceed to concat
-
-# How to use it when concatenating
-
-# First, detect headers per file to get rows_to_skip.
-# Then read each CSV with skiprows=rows_to_skip and header=None.
-# Align columns as needed and concatenate.
-# Example concat pattern:
-
-for each file:
-det = detect_header_rows_in_top4(file)
-df = pd.read_csv(file, skiprows=det.rows_to_skip, header=None, dtype=str, keep_default_na=False)
-add df to list
-pd.concat(list_of_df, ignore_index=True)
-
-
-# Below is a clean, production-style implementation to classify each table into patterns A/B/C/D and the whole document into A/B/C/D/E. It uses dataclasses, clear feature extraction, and explainable rules aligned to your specification.
-
-# Inputs
-
-# tables: list of pandas DataFrames (each is one table extracted from a page).
-# merged_cells_per_table: list parallel to tables. For each table, a list of merged-cell dicts with at least:
-# row_index (1-based), column_index (1-based), row_span, column_span
-# Optional: covers (list of (row, col) 1-based positions)
-# Optional input (recommended)
-
-# header_info_list: list parallel to tables. If you already detect headers, pass:
-# header_row_indices: list of 0-based row indices in the top of the CSV that are headers (e.g., [0] or [0,1])
-# header_valid: bool
-# header_names: list of column names (if built from header rows; otherwise we’ll build them)
-# What the code returns
-
-# PagePatternResult for each table (A/B/C/D with confidence and reasons).
-# DocumentPatternResult for the whole PDF (A/B/C/D/E) with reasons and diagnostics.
-# Explanation of the approach
-
-# We compute features per table:
-# header presence and quality, normalized header names (synonym-aware)
-# data region start row, mode column count, row-column count variance
-# grid regularity, merged ratios in header and body
-# continuation markers (if visible in the table text)
-# We select a reference header (usually the first valid header page).
-# Per-page classification:
-# A: header present, grid-regular, consistent with reference
-# B: no header on continuation pages but grid-regular and consistent column structure with reference
-# C: header present, grid-regular, but inconsistent headers/schema vs. reference
-# D: noisy/corrupted (missing header and poor grid; high row variance; etc.)
-# Document-level classification:
-# A if all A
-# B if only A/B and B occurs on pages after the reference page
-# C if only A/C
-# D if all D
-# E if mixed kinds beyond the above
-# Code (drop-in)
-
-# Requires: pandas
-
-# Below is focused, production-style code to detect Pattern A (Fully Structured Tables) only.
-
-# What it does
-
-# Page-level: determines if a single table is Type A using:
-# header present on the page
-# grid-like structure (stable column count across data rows)
-# minimal/no merges in the body (merged cells are okay in header)
-# Document-level: determines if the entire document is Type A:
-# every table is Type A at page level
-# headers exist on every page and are exactly consistent (same names, same order)
-# data column counts are consistent across pages
-# No header normalization is performed (no synonyms). Only trimming/whitespace handling is used.
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Tuple
 from enum import Enum
+import re
 import pandas as pd
 
 
-# =========================
-# Data models
-# =========================
-
-class TablePattern(str, Enum):
-    A = "A"  # Fully structured
-
+# -----------------------------------------------------------
+# Data models (reuse if already defined in your project)
+# -----------------------------------------------------------
 
 @dataclass
 class HeaderInfo:
-    # Your detector’s outputs for each table
     header_row_indices: List[int]                  # 0-based indices of header rows
     header_valid: bool = True                      # your detector’s validity flag
-    header_names: Optional[List[str]] = None       # column names built from header rows (as-is, not normalized)
+    header_names: Optional[List[str]] = None       # as-is (not normalized)
     debug: Dict[str, Any] = field(default_factory=dict)
-
 
 @dataclass
 class TableInput:
     df: pd.DataFrame
-    page_index: int                                # 1-based logical page
+    page_index: int                                # 1-based page number (or logical order)
     table_index_on_page: int = 1
     header_info: Optional[HeaderInfo] = None
     # merged_cells: list of dicts with keys row_index, column_index, row_span, column_span (1-based indices)
     merged_cells: Optional[List[Dict[str, Any]]] = None
 
 
-@dataclass
-class TableAFeatures:
-    # Minimal features sufficient for Pattern A detection
-    has_header: bool
-    header_rows: List[int]                         # 0-based
-    header_names_raw: List[str]                    # as-is (not normalized)
-    header_cols_count: int
-    data_start_row: int                            # 0-based
-    data_rows_count: int
-    data_mode_cols: int                            # modal non-empty cell count across data rows
-    row_colcount_variance_ratio: float             # fraction of data rows deviating from mode
-    body_merged_anchors: int                       # merged cells starting in body rows
-    reasons: List[str] = field(default_factory=list)
-
-
-@dataclass
-class PageAPatternResult:
-    page_index: int
-    table_index_on_page: int
-    is_type_a: bool
-    confidence: float
-    reasons: List[str]
-    features: TableAFeatures
-
-
-@dataclass
-class DocumentAResult:
-    is_type_a_document: bool
-    confidence: float
-    page_results: List[PageAPatternResult]
-    reference_page_index: Optional[int]
-    reference_headers: Optional[List[str]]
-    reasons: List[str]
-    header_equality_by_page: List[Tuple[int, bool]]  # (page_index, equal_to_reference)
-    colcount_equality_by_page: List[Tuple[int, bool]]
-
-
 # =========================
-# Config
+# Enums and dataclasses for Pattern B
 # =========================
 
+class TablePattern(str, Enum):
+    B = "B"  # Continuation (headers on first page only)
+
 @dataclass
-class PatternAConfig:
-    # Grid regularity thresholds
-    max_row_colcount_deviation_ratio: float = 0.2  # <= 20% of data rows can deviate from mode
+class PatternBConfig:
+    # Grid regularity thresholds (same idea as Pattern A)
+    max_row_colcount_deviation_ratio: float = 0.2
     min_data_rows_for_analysis: int = 5
 
-    # Body merges allowance (strict)
+    # Body merges not allowed for B (like A)
     max_body_merged_anchors: int = 0
 
-    # Document-level strictness
-    require_header_on_every_page: bool = True
-    require_exact_header_equality_across_pages: bool = True
-    require_equal_data_mode_cols_across_pages: bool = True
+    # Continuation markers (optional heuristic)
+    continuation_tokens: List[str] = field(default_factory=lambda: [
+        "continued", "carried forward", "carry forward", "carry fwd", "to be continued"
+    ])
+    # Page marker tokens often seen around footer/header text
+    page_marker_tokens: List[str] = field(default_factory=lambda: ["page", "of"])
+
+    # How many top/bottom rows to scan for markers
+    scan_top_rows_for_markers: int = 2
+    scan_bottom_rows_for_markers: int = 2
+
+    # B requires a reference page with header
+    require_reference_header: bool = True
+
+    # Columns consistency with reference (strict)
+    require_same_mode_cols_as_reference: bool = True
+
+    # Allow partial headers on continuation pages (as per edge cases)
+    allow_partial_headers_on_continuation: bool = True
+    partial_header_max_columns: int = 2  # e.g., small “Description | Amount” partial header
+
+@dataclass
+class TableBFeatures:
+    is_reference_page: bool
+    has_header: bool
+    header_rows: List[int]                # 0-based (as detected)
+    header_names_raw: List[str]           # as-is (not normalized)
+    header_cols_count: int
+    data_start_row: int                   # 0-based first data row
+    data_rows_count: int
+    data_mode_cols: int
+    row_colcount_variance_ratio: float    # fraction of data rows deviating from mode
+    body_merged_anchors: int
+    continuation_markers_found: bool
+    reasons: List[str] = field(default_factory=list)
+
+@dataclass
+class PageBPatternResult:
+    page_index: int
+    table_index_on_page: int
+    is_type_b: bool
+    confidence: float
+    reasons: List[str]
+    features: TableBFeatures
+
+@dataclass
+class DocumentBResult:
+    is_type_b_document: bool
+    confidence: float
+    page_results: List[PageBPatternResult]
+    reference_page_index: Optional[int]
+    reference_mode_cols: Optional[int]
+    reasons: List[str]
 
 
 # =========================
@@ -1151,31 +116,26 @@ def _mode(values: List[int]) -> int:
     return Counter(values).most_common(1)[0][0]
 
 def _extract_header_names_raw(df: pd.DataFrame, header_rows: List[int], header_names: Optional[List[str]]) -> List[str]:
-    # If caller already supplied header_names (built from header rows), use them as-is
     if header_names:
         return [str(x) for x in header_names]
-    # Else pick the last header row as the basis for column names
     if header_rows:
         last_idx = header_rows[-1]
         if 0 <= last_idx < len(df):
-            return [ _squeeze(str(x)) for x in df.iloc[last_idx].tolist() ]
-    # Fallback: use DataFrame column indices
-    return [str(c) for c in range(df.shape[1])]
+            return [_squeeze(str(x)) for x in df.iloc[last_idx].tolist()]
+    return []
 
 def _compute_data_start_row(header_rows: List[int]) -> int:
     return (max(header_rows) + 1) if header_rows else 0
 
 def _count_body_merged_anchors(merged_cells: Optional[List[Dict[str, Any]]], data_start_row_0based: int) -> int:
-    # merged_cells row_index is 1-based; convert to 0-based to compare with data_start_row
     if not merged_cells:
         return 0
     count = 0
     for m in merged_cells:
         r = int(m.get("row_index") or m.get("RowIndex") or 1)
-        r0 = r - 1
         rs = int(m.get("row_span") or m.get("RowSpan") or 1)
         cs = int(m.get("column_span") or m.get("ColumnSpan") or 1)
-        # Only count anchors (top-left merged cell); AWS usually gives spans on that anchor
+        r0 = r - 1
         if r0 >= data_start_row_0based and (rs > 1 or cs > 1):
             count += 1
     return count
@@ -1183,7 +143,7 @@ def _count_body_merged_anchors(merged_cells: Optional[List[Dict[str, Any]]], dat
 def _analyze_data_region(df: pd.DataFrame, data_start_row: int) -> Tuple[int, int, float, List[int]]:
     """
     Returns:
-      data_rows_count, data_mode_cols, row_colcount_variance_ratio, per_row_nonempty_counts
+        data_rows_count, data_mode_cols, row_colcount_variance_ratio, per_row_nonempty_counts
     """
     if df.empty or data_start_row >= len(df):
         return 0, 0, 0.0, []
@@ -1193,7 +153,6 @@ def _analyze_data_region(df: pd.DataFrame, data_start_row: int) -> Tuple[int, in
         row = df.iloc[i].tolist()
         nonempty_counts.append(_nonempty_count(row))
 
-    # Ignore completely empty trailing rows from analysis (footers/notes often empty)
     analyzed = [c for c in nonempty_counts if c > 0]
     data_rows_count = len(analyzed)
     if data_rows_count == 0:
@@ -1204,12 +163,37 @@ def _analyze_data_region(df: pd.DataFrame, data_start_row: int) -> Tuple[int, in
     variance_ratio = deviations / data_rows_count
     return data_rows_count, m, variance_ratio, nonempty_counts
 
+def _scan_for_continuation_markers(df: pd.DataFrame, cfg: PatternBConfig) -> bool:
+    tokens = set([t.lower() for t in (cfg.continuation_tokens + cfg.page_marker_tokens)])
+    rows_to_scan = []
+
+    # Top N rows
+    for i in range(min(cfg.scan_top_rows_for_markers, len(df))):
+        rows_to_scan.append(df.iloc[i].tolist())
+    # Bottom N rows
+    for i in range(max(0, len(df) - cfg.scan_bottom_rows_for_markers), len(df)):
+        rows_to_scan.append(df.iloc[i].tolist())
+
+    for r in rows_to_scan:
+        text = _squeeze(" ".join([str(x) for x in r])).lower()
+        if not text:
+            continue
+        for t in tokens:
+            if t in text:
+                return True
+    return False
+
 
 # =========================
-# Page-level Pattern A
+# Feature extraction for Pattern B
 # =========================
 
-def extract_table_a_features(table: TableInput, cfg: PatternAConfig) -> TableAFeatures:
+def extract_table_b_features(
+    table: TableInput,
+    cfg: PatternBConfig,
+    reference_page_index: Optional[int],
+    reference_mode_cols: Optional[int]
+) -> TableBFeatures:
     df = table.df
     hi = table.header_info or HeaderInfo(header_row_indices=[], header_valid=False, header_names=None)
 
@@ -1219,40 +203,27 @@ def extract_table_a_features(table: TableInput, cfg: PatternAConfig) -> TableAFe
     header_cols_count = len(header_names_raw) if has_header else 0
 
     data_start_row = _compute_data_start_row(header_rows)
-    data_rows_count, data_mode_cols, variance_ratio, per_row_counts = _analyze_data_region(df, data_start_row)
+    data_rows_count, data_mode_cols, variance_ratio, _ = _analyze_data_region(df, data_start_row)
     body_merged_anchors = _count_body_merged_anchors(table.merged_cells, data_start_row)
+    continuation_markers_found = _scan_for_continuation_markers(df, cfg)
+
+    is_reference_page = (reference_page_index is not None and table.page_index == reference_page_index)
 
     reasons: List[str] = []
+    if is_reference_page:
+        reasons.append("This page is the reference (first valid header page).")
     if has_header:
-        reasons.append("Header detected and valid.")
+        reasons.append(f"Header present: rows={header_rows}.")
     else:
-        reasons.append("Header missing or invalid.")
+        reasons.append("No header present on this page.")
 
-    if data_rows_count >= cfg.min_data_rows_for_analysis:
-        reasons.append(f"Data rows sufficient ({data_rows_count} rows).")
-    else:
-        reasons.append(f"Few data rows ({data_rows_count} < {cfg.min_data_rows_for_analysis}).")
+    reasons.append(f"Data rows: {data_rows_count}, mode non-empty cols: {data_mode_cols}, variance ratio: {variance_ratio:.2f}.")
+    reasons.append(f"Body merged anchors: {body_merged_anchors}.")
+    if continuation_markers_found:
+        reasons.append("Continuation markers found near top/bottom.")
 
-    reasons.append(f"Data mode non-empty cols = {data_mode_cols}. Variance ratio = {variance_ratio:.2f}.")
-    if variance_ratio <= cfg.max_row_colcount_deviation_ratio:
-        reasons.append("Grid regularity OK.")
-    else:
-        reasons.append("Grid irregular (too many rows deviate from mode).")
-
-    reasons.append(f"Body merged anchors = {body_merged_anchors}.")
-    if body_merged_anchors <= cfg.max_body_merged_anchors:
-        reasons.append("No body merges (OK).")
-    else:
-        reasons.append("Found body merges (not allowed for Type A).")
-
-    # Consistency between header and data cols (soft check; some rows may be sparse)
-    if has_header and data_mode_cols > 0:
-        if data_mode_cols == header_cols_count:
-            reasons.append("Header column count matches data mode column count.")
-        else:
-            reasons.append("Header column count differs from data mode column count.")
-
-    return TableAFeatures(
+    return TableBFeatures(
+        is_reference_page=is_reference_page,
         has_header=has_header,
         header_rows=header_rows,
         header_names_raw=header_names_raw,
@@ -1262,312 +233,232 @@ def extract_table_a_features(table: TableInput, cfg: PatternAConfig) -> TableAFe
         data_mode_cols=data_mode_cols,
         row_colcount_variance_ratio=variance_ratio,
         body_merged_anchors=body_merged_anchors,
+        continuation_markers_found=continuation_markers_found,
         reasons=reasons,
     )
 
-def classify_page_pattern_a(table: TableInput, cfg: Optional[PatternAConfig] = None) -> PageAPatternResult:
-    cfg = cfg or PatternAConfig()
-    feats = extract_table_a_features(table, cfg)
 
-    is_grid_regular = feats.row_colcount_variance_ratio <= cfg.max_row_colcount_deviation_ratio
-    has_enough_rows = feats.data_rows_count >= cfg.min_data_rows_for_analysis
+# =========================
+# Page-level Pattern B
+# =========================
+
+def classify_page_pattern_b(
+    table: TableInput,
+    cfg: Optional[PatternBConfig],
+    reference_page_index: Optional[int],
+    reference_mode_cols: Optional[int]
+) -> PageBPatternResult:
+    cfg = cfg or PatternBConfig()
+    feats = extract_table_b_features(table, cfg, reference_page_index, reference_mode_cols)
+
+    reasons = list(feats.reasons)
+
+    # Can only be a continuation if it's NOT the reference page
+    not_reference = (reference_page_index is not None and table.page_index != reference_page_index)
+
+    # Header condition
+    header_condition = False
+    if not feats.has_header:
+        header_condition = True  # typical Pattern B
+        reasons.append("Header condition OK: no header on continuation page.")
+    elif cfg.allow_partial_headers_on_continuation and (feats.header_cols_count <= cfg.partial_header_max_columns):
+        header_condition = True
+        reasons.append(f"Header condition OK: partial header allowed (cols={feats.header_cols_count}).")
+    else:
+        reasons.append("Header condition failed (full header present).")
+
+    # Grid regularity
+    grid_regular = feats.row_colcount_variance_ratio <= cfg.max_row_colcount_deviation_ratio
+    if grid_regular:
+        reasons.append("Grid regularity OK.")
+    else:
+        reasons.append("Grid irregular (too many rows deviate from mode).")
+
+    # Body merges
     no_body_merges = feats.body_merged_anchors <= cfg.max_body_merged_anchors
-    header_data_col_match = True
-    if feats.has_header and feats.data_mode_cols > 0:
-        header_data_col_match = (feats.header_cols_count == feats.data_mode_cols)
+    if no_body_merges:
+        reasons.append("No body merges (OK).")
+    else:
+        reasons.append("Found body merges (not allowed for Type B).")
 
-    # Base decision
-    is_type_a = (
-        feats.has_header and
-        is_grid_regular and
+    # Column count alignment with reference
+    cols_match_reference = True
+    if cfg.require_same_mode_cols_as_reference:
+        if reference_mode_cols is None or reference_mode_cols == 0:
+            cols_match_reference = False
+            reasons.append("No reference mode column count available; cannot verify columns match.")
+        else:
+            cols_match_reference = (feats.data_mode_cols == reference_mode_cols)
+            if cols_match_reference:
+                reasons.append(f"Data mode cols match reference ({reference_mode_cols}).")
+            else:
+                reasons.append(f"Data mode cols ({feats.data_mode_cols}) differ from reference ({reference_mode_cols}).")
+
+    # Enough data rows
+    enough_rows = feats.data_rows_count >= cfg.min_data_rows_for_analysis
+    if enough_rows:
+        reasons.append("Data rows sufficient.")
+    else:
+        reasons.append("Few data rows for robust decision.")
+
+    # Final decision for page-level B
+    is_type_b = (
+        not_reference and
+        header_condition and
+        grid_regular and
         no_body_merges and
-        has_enough_rows and
-        header_data_col_match
+        cols_match_reference and
+        enough_rows
     )
 
-    # Confidence scoring (simple, explainable)
-    confidence = 1.0
-    if not feats.has_header:
-        confidence -= 0.4
-    if not is_grid_regular:
-        confidence -= 0.3
-    if not no_body_merges:
-        confidence -= 0.2
-    if not has_enough_rows:
-        confidence -= 0.1
-    if feats.has_header and not header_data_col_match:
+    # Confidence: base from strong signals
+    confidence = 0.5
+    if not_reference:
+        confidence += 0.1
+    if header_condition:
+        confidence += 0.2
+    if grid_regular:
+        confidence += 0.1
+    if no_body_merges:
+        confidence += 0.05
+    if cols_match_reference:
+        confidence += 0.1
+    if feats.continuation_markers_found:
+        confidence += 0.05
+    if not enough_rows:
         confidence -= 0.1
 
     confidence = max(0.0, min(1.0, confidence))
-
-    reasons = list(feats.reasons)
-    if is_type_a:
-        reasons.insert(0, "Classified as Type A (fully structured).")
+    if is_type_b:
+        reasons.insert(0, "Classified as Type B (continuation page).")
     else:
-        reasons.insert(0, "Not Type A.")
+        reasons.insert(0, "Not Type B.")
 
-    return PageAPatternResult(
+    return PageBPatternResult(
         page_index=table.page_index,
         table_index_on_page=table.table_index_on_page,
-        is_type_a=is_type_a,
+        is_type_b=is_type_b,
         confidence=confidence,
         reasons=reasons,
         features=feats,
     )
 
+
 # =========================
-# Document-level Pattern A
+# Document-level Pattern B
 # =========================
 
-def classify_document_pattern_a(
+def classify_document_pattern_b(
     tables: List[TableInput],
-    cfg: Optional[PatternAConfig] = None
-) -> DocumentAResult:
+    cfg: Optional[PatternBConfig] = None
+) -> DocumentBResult:
     """
-    Classify an entire document as Pattern A (Fully Structured) or not, based on:
-      - All pages classified as Type A at page-level
-      - Optional strictness: header on every page, exact same header names on all pages,
-        and equal modal data columns across pages
-
-    Returns a DocumentAResult with page results, reference header, equality checks, and reasons.
+    Document is considered Pattern B if:
+      - There is a valid reference page (first page with header).
+      - Reference page acts as schema origin.
+      - One or more subsequent pages classify as Type B (continuations).
     """
-    cfg = cfg or PatternAConfig()
+    cfg = cfg or PatternBConfig()
 
     if not tables:
-        return DocumentAResult(
-            is_type_a_document=False,
+        return DocumentBResult(
+            is_type_b_document=False,
             confidence=0.0,
             page_results=[],
             reference_page_index=None,
-            reference_headers=None,
+            reference_mode_cols=None,
             reasons=["No tables provided."],
-            header_equality_by_page=[],
-            colcount_equality_by_page=[],
         )
 
-    # Page-level classification
-    page_results: List[PageAPatternResult] = [classify_page_pattern_a(t, cfg) for t in tables]
-
-    # Pick reference: first page that has a header
-    reference_idx: Optional[int] = None
-    reference_headers: Optional[List[str]] = None
+    # Find reference page: the first page with a valid header
+    reference_page_index: Optional[int] = None
     reference_mode_cols: Optional[int] = None
 
-    for pr in page_results:
-        if pr.features.has_header:
-            reference_idx = pr.page_index
-            reference_headers = pr.features.header_names_raw
-            reference_mode_cols = pr.features.data_mode_cols
+    for t in tables:
+        hi = t.header_info or HeaderInfo(header_row_indices=[], header_valid=False, header_names=None)
+        if hi.header_valid and hi.header_row_indices:
+            data_start = (max(hi.header_row_indices) + 1) if hi.header_row_indices else 0
+            data_rows_count, data_mode_cols, _, _ = _analyze_data_region(t.df, data_start)
+            reference_page_index = t.page_index
+            reference_mode_cols = data_mode_cols
             break
 
     reasons: List[str] = []
-    header_equality_by_page: List[Tuple[int, bool]] = []
-    colcount_equality_by_page: List[Tuple[int, bool]] = []
-
-    all_pages_type_a = all(pr.is_type_a for pr in page_results)
-    if all_pages_type_a:
-        reasons.append("All pages classified as Type A at page-level.")
+    if reference_page_index is not None:
+        reasons.append(f"Found reference page at page_index={reference_page_index} with mode cols={reference_mode_cols}.")
     else:
-        reasons.append("Not all pages are Type A at page-level.")
+        reasons.append("No reference page with header found.")
+        if cfg.require_reference_header:
+            return DocumentBResult(
+                is_type_b_document=False,
+                confidence=0.0,
+                page_results=[],
+                reference_page_index=None,
+                reference_mode_cols=None,
+                reasons=reasons + ["Reference header is required for Pattern B document."],
+            )
 
-    # Check headers on every page if required
-    headers_on_every_page = all(pr.features.has_header for pr in page_results)
-    if cfg.require_header_on_every_page:
-        if headers_on_every_page:
-            reasons.append("Headers present on every page (required).")
-        else:
-            reasons.append("Missing headers on some pages (required for Type A document).")
+    # Page-level B classification using the reference
+    page_results: List[PageBPatternResult] = []
+    for t in tables:
+        pr = classify_page_pattern_b(
+            t, cfg, reference_page_index=reference_page_index, reference_mode_cols=reference_mode_cols
+        )
+        page_results.append(pr)
+
+    # Decide document-level Pattern B:
+    continuation_pages_b = [pr for pr in page_results if pr.is_type_b]
+    has_b_pages = len(continuation_pages_b) > 0
+    is_type_b_document = (reference_page_index is not None) and has_b_pages
+
+    if is_type_b_document:
+        reasons.insert(0, "Document classified as Type B (continuation pages detected).")
     else:
-        reasons.append("Header presence on every page not required by config.")
+        reasons.insert(0, "Document not classified as Type B.")
 
-    # Header equality across pages (exact, no normalization)
-    headers_equal_all = True
-    if cfg.require_exact_header_equality_across_pages:
-        if reference_headers is None:
-            headers_equal_all = False
-            reasons.append("No reference header found; cannot enforce exact header equality.")
-        else:
-            for pr in page_results:
-                eq = pr.features.has_header and (pr.features.header_names_raw == reference_headers)
-                header_equality_by_page.append((pr.page_index, eq))
-                if not eq:
-                    headers_equal_all = False
-            if headers_equal_all:
-                reasons.append("Exact header names match across all pages (required).")
-            else:
-                reasons.append("Header names differ on some pages (required exact match).")
+    # Confidence: based on fraction of continuation pages (after reference) that qualify as B
+    total_after_ref = sum(1 for t in tables if reference_page_index is not None and t.page_index != reference_page_index)
+    frac_b = (len(continuation_pages_b) / total_after_ref) if total_after_ref > 0 else 0.0
+
+    # Scale confidence: average of B-page confidences adjusted by coverage
+    if continuation_pages_b:
+        avg_b_conf = sum(pr.confidence for pr in continuation_pages_b) / len(continuation_pages_b)
     else:
-        reasons.append("Exact header equality across pages not required by config.")
-        # Still populate diagnostics if reference exists
-        if reference_headers is not None:
-            for pr in page_results:
-                eq = pr.features.has_header and (pr.features.header_names_raw == reference_headers)
-                header_equality_by_page.append((pr.page_index, eq))
+        avg_b_conf = 0.0
+    doc_confidence = max(0.0, min(1.0, 0.5 * avg_b_conf + 0.5 * frac_b))
 
-    # Data mode column count equality across pages
-    colcount_equal_all = True
-    if cfg.require_equal_data_mode_cols_across_pages:
-        if reference_mode_cols is None:
-            colcount_equal_all = False
-            reasons.append("No reference data mode column count; cannot enforce equal column counts.")
-        else:
-            for pr in page_results:
-                eq = (pr.features.data_mode_cols == reference_mode_cols)
-                colcount_equality_by_page.append((pr.page_index, eq))
-                if not eq:
-                    colcount_equal_all = False
-            if colcount_equal_all:
-                reasons.append("Data mode column count matches across all pages (required).")
-            else:
-                reasons.append("Data mode column count differs on some pages (required match).")
-    else:
-        reasons.append("Equal data mode column counts not required by config.")
-        if reference_mode_cols is not None:
-            for pr in page_results:
-                eq = (pr.features.data_mode_cols == reference_mode_cols)
-                colcount_equality_by_page.append((pr.page_index, eq))
-
-    # Final document-level decision
-    is_doc_type_a = all_pages_type_a
-    if cfg.require_header_on_every_page:
-        is_doc_type_a = is_doc_type_a and headers_on_every_page
-    if cfg.require_exact_header_equality_across_pages:
-        is_doc_type_a = is_doc_type_a and headers_equal_all
-    if cfg.require_equal_data_mode_cols_across_pages:
-        is_doc_type_a = is_doc_type_a and colcount_equal_all
-
-    # Confidence: start from average page confidence, subtract penalties for doc-level violations
-    avg_page_conf = sum(pr.confidence for pr in page_results) / len(page_results)
-    penalty = 0.0
-    if cfg.require_header_on_every_page and not headers_on_every_page:
-        penalty += 0.25
-    if cfg.require_exact_header_equality_across_pages and not headers_equal_all:
-        penalty += 0.25
-    if cfg.require_equal_data_mode_cols_across_pages and not colcount_equal_all:
-        penalty += 0.2
-    if not all_pages_type_a:
-        penalty += 0.2
-
-    doc_confidence = max(0.0, min(1.0, avg_page_conf - penalty))
-    if is_doc_type_a:
-        reasons.insert(0, "Document classified as Type A (fully structured across pages).")
-    else:
-        reasons.insert(0, "Document not classified as Type A.")
-
-    return DocumentAResult(
-        is_type_a_document=is_doc_type_a,
+    return DocumentBResult(
+        is_type_b_document=is_type_b_document,
         confidence=doc_confidence,
         page_results=page_results,
-        reference_page_index=reference_idx,
-        reference_headers=reference_headers,
+        reference_page_index=reference_page_index,
+        reference_mode_cols=reference_mode_cols,
         reasons=reasons,
-        header_equality_by_page=header_equality_by_page,
-        colcount_equality_by_page=colcount_equality_by_page,
     )
 
-# input
-cfg = PatternAConfig()
-doc_result = classify_document_pattern_a(tables, cfg)
 
-print(doc_result.is_type_a_document, round(doc_result.confidence, 3))
-for pr in doc_result.page_results:
-    print(f"Page {pr.page_index} -> Type A: {pr.is_type_a}, conf={round(pr.confidence,3)}")
+# You provide a list of TableInput objects (per table/page) with:
+# df: pandas DataFrame containing the table (header=None when reading CSVs)
+# header_info: your detected header rows/validity (no normalization)
+# merged_cells: optional list of merged cells with row_index/column_index/row_span/column_span (1-based)
+# The code finds a reference page (first valid header), then classifies later pages as B if they look like continuations.
 
+How to use
 
+# Build TableInput objects with your DataFrames, header detection results, and merged-cells list.
+# Call classify_document_pattern_b(tables).
+# Example
 
-# Short answer
+# After reading CSVs as df (header=None) and running your header detector:
 
-# You pass a list of TableInput objects.
-# Each TableInput contains:
-# df: the table CSV loaded into a pandas DataFrame (header=None, raw rows).
-# page_index: the document page number this table came from.
-# table_index_on_page: 1 if only one table per page (or increment if multiple).
-# header_info: your detected header rows/validity (HeaderInfo).
-# merged_cells: list of merged cell dicts with row_index/column_index/row_span/column_span (1-based, as in Textract).
-# Details
+tables = [TableInput(df=df1, page_index=1, header_info=HeaderInfo([0], True)),
+TableInput(df=df2, page_index=2, header_info=HeaderInfo([], False))]
 
-# df (pandas.DataFrame): Read the CSV exactly as saved from Textract’s matrix (no header inference).
-# Use: pd.read_csv(path, header=None, dtype=str, keep_default_na=False)
-# The DataFrame’s row 0 should correspond to Textract table row_index 1, row 1 -> 2, etc.
-# header_info (HeaderInfo):
-# header_row_indices: 0-based indices of header rows in df (from your header detector).
-# header_valid: True/False from your validation.
-# header_names (optional): if you already built column names from header rows; otherwise leave None and the code will use the last header row values as the header names during analysis.
-# merged_cells: list of dicts for cells that span multiple rows/columns.
-# Required keys per item:
-# row_index: 1-based table row anchor (Textract RowIndex).
-# column_index: 1-based table column anchor (Textract ColumnIndex).
-# row_span: integer span (>=1).
-# column_span: integer span (>=1).
-# Example: {"row_index": 1, "column_index": 1, "row_span": 1, "column_span": 3}
-# If you don’t have merged cells, pass an empty list or None.
-# Optional input
+result = classify_document_pattern_b(tables)
 
-# PatternAConfig to tune thresholds:
-# max_row_colcount_deviation_ratio (default 0.2)
-# min_data_rows_for_analysis (default 5)
-# max_body_merged_anchors (default 0)
-# require_header_on_every_page, require_exact_header_equality_across_pages, require_equal_data_mode_cols_across_pages
-# Minimal example (building inputs and running document-level Pattern A)
+print(result.is_type_b_document, round(result.confidence, 3))
 
-# Assume you already:
-# saved per-table CSVs,
-# detected header rows for each table (header_row_indices),
-# extracted merged cells from Textract JSON.
+for pr in result.page_results:
 
-# Example code:
-
-from typing import List
-import pandas as pd
-
-Your lists collected from earlier steps
-csv_paths = ["tables_out/page_1_t1.csv", "tables_out/page_2_t1.csv"]
-pages = [1, 2] # page_index for each table
-header_rows_per_table = [[0], []] # example: page 1 has header at row 0, page 2 has none
-merged_cells_per_table = [
-[ # page 1: a merged header cell spanning 3 columns
-{"row_index": 1, "column_index": 1, "row_span": 1, "column_span": 3}
-],
-[] # page 2: no merged cells detected
-]
-
-tables: List[TableInput] = []
-for i, path in enumerate(csv_paths):
-df = pd.read_csv(path, header=None, dtype=str, keep_default_na=False)
-hi = HeaderInfo(
-header_row_indices=header_rows_per_table[i],
-header_valid=bool(header_rows_per_table[i]), # or your own validation boolean
-header_names=None # let the detector use the last header row values
-)
-t = TableInput(
-df=df,
-page_index=pages[i],
-table_index_on_page=1,
-header_info=hi,
-merged_cells=merged_cells_per_table[i],
-)
-tables.append(t)
-
-Run Pattern A page-level + document-level detection
-doc_res = classify_document_pattern_a(tables) # PatternAConfig() is optional
-
-print("Document is Type A:", doc_res.is_type_a_document, "confidence:", round(doc_res.confidence, 3))
-for pr in doc_res.page_results:
-print(f"Page {pr.page_index} table {pr.table_index_on_page} -> Type A: {pr.is_type_a}, conf={round(pr.confidence,3)}")
-# Optional: pr.reasons for explanation
-
-# How to prepare merged_cells from Textract tables
-
-# If you kept the rich tables from the Textract JSON parsing step:
-# For each table, build merged_cells as:
-# for each cell in table["cells"]:
-# if RowSpan > 1 or ColumnSpan > 1: add a dict with row_index, column_index, row_span, column_span
-# Ensure row_index/column_index are the Textract 1-based indices aligned to the CSV’s row/column positions.
-# Notes
-
-# Do not skip header rows when reading the CSV into df. The classifier expects df to contain header rows at the top so it can compute data_start_row correctly based on header_row_indices.
-# If a table has very few data rows (< min_data_rows_for_analysis), lower the threshold in PatternAConfig.
-# This Pattern A detector is strict by default:
-# No merged cells allowed in the body (merged headers okay).
-# Consistent grid (stable column count) in the data rows.
-
+    print(pr.page_index, pr.is_type_b, round(pr.confidence, 3))
+    print(result.reasons)
