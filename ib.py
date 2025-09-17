@@ -443,7 +443,7 @@ def classify_document_pattern_b(
 # merged_cells: optional list of merged cells with row_index/column_index/row_span/column_span (1-based)
 # The code finds a reference page (first valid header), then classifies later pages as B if they look like continuations.
 
-How to use
+# How to use
 
 # Build TableInput objects with your DataFrames, header detection results, and merged-cells list.
 # Call classify_document_pattern_b(tables).
@@ -462,3 +462,53 @@ for pr in result.page_results:
 
     print(pr.page_index, pr.is_type_b, round(pr.confidence, 3))
     print(result.reasons)
+
+
+
+# IF every page has header
+#     IF headers are identical → Type A
+#     ELSE → Type C
+# ELSE IF only first page has header
+#     IF subsequent rows align with same column count → Type B
+#     ELSE → Type D
+# ELSE (mix of some pages with headers, some without)
+#     → Type E
+
+def detect_pattern(textract_json):
+    headers = extract_headers_per_page(textract_json)
+    first_header = headers[0]
+    
+    header_flags = []
+    for h in headers:
+        if h: header_flags.append(1)
+        else: header_flags.append(0)
+
+    # Case 1: All pages have headers
+    if all(header_flags):
+        if all(similar(h, first_header) for h in headers):
+            return "Type A"
+        else:
+            return "Type C"
+
+    # Case 2: Only first page header
+    if header_flags[0] == 1 and all(f == 0 for f in header_flags[1:]):
+        if check_column_alignment(headers, first_header):
+            return "Type B"
+        else:
+            return "Type D"
+
+    # Case 3: Mixed headers
+    return "Type E"
+
+
+def normalize_tables(textract_json, ib_type):
+    if ib_type == "Type A":
+        return merge_drop_repeat_headers(textract_json)
+    elif ib_type == "Type B":
+        return propagate_first_header(textract_json)
+    elif ib_type == "Type C":
+        return unify_with_header_mapping(textract_json)
+    elif ib_type == "Type D":
+        return align_with_positions(textract_json)
+    elif ib_type == "Type E":
+        return normalize_pagewise(textract_json)
